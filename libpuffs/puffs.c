@@ -463,10 +463,11 @@ puffs_daemon(struct puffs_usermount *pu, int nochdir, int noclose)
 			if (fd > STDERR_FILENO)
 				close(fd);
 		}
+		/* Be nice and write all-is-ok */
 		value = 0;
 		if (write(pu->pu_dpipe[1], &value, sizeof(value))
 		    != sizeof(value))
-			warnx("child pipe write() failed");
+			syslog(LOG_ERR, "child pipe write() failed");
 		return 0;
 	}
 
