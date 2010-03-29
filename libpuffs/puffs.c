@@ -438,26 +438,35 @@ puffs_daemon(struct puffs_usermount *pu, int nochdir, int noclose)
 			    sizeof(value));
 		if (value) {
 			errno = value;
-			err(1, "puffs_daemon (read value != 0: %d)", value);
+			err(1, "puffs_daemon (child returned: %d)", value);
 		}
 		exit(0);
 	} else {
-		if (setsid() == -1)
+		if (setsid() == -1) {
+			warnx("setsid() failed in child");
 			goto fail;
+		}
 
 		if (!nochdir)
 			chdir("/");
 
 		if (!noclose) {
 			fd = open(_PATH_DEVNULL, O_RDWR, 0);
-			if (fd == -1)
+			if (fd == -1) {
+				syslog(LOG_ERR, "%s open failed in child",
+				    _PATH_DEVNULL);
 				goto fail;
+			}
 			dup2(fd, STDIN_FILENO);
 			dup2(fd, STDOUT_FILENO);
 			dup2(fd, STDERR_FILENO);
 			if (fd > STDERR_FILENO)
 				close(fd);
 		}
+		value = 0;
+		if (write(pu->pu_dpipe[1], &value, sizeof(value))
+		    != sizeof(value))
+			warnx("child pipe write() failed");
 		return 0;
 	}
 
@@ -497,6 +506,7 @@ puffs_mount(struct puffs_usermount *pu, const char *dir, int mntflags,
 
 	if (realpath(dir, rp) == NULL) {
 		rv = -1;
+		warnx("realpath(%s) failed with %d", dir, errno);
 		goto out;
 	}
 
@@ -520,12 +530,14 @@ puffs_mount(struct puffs_usermount *pu, const char *dir, int mntflags,
 		size_t len;
 
 		if (sscanf(comfd, "%d", &pu->pu_fd) != 1) {
+			warnx("sscanf() failed");
 			errno = EINVAL;
 			rv = -1;
 			goto out;
 		}
 		/* check that what we got at least resembles an fd */
 		if (fcntl(pu->pu_fd, F_GETFL) == -1) {
+			warnx("fcntl() failed with %d", errno);
 			rv = -1;
 			goto out;
 		}
@@ -580,16 +592,20 @@ do {									\
 		iov[5].iov_base = pu->pu_kargp;
 		iov[5].iov_len = sizeof(struct puffs_kargs);
 
-		if ((rv = nmount(iov, 6, mntflags)) == -1)
+		if ((rv = nmount(iov, 6, mntflags)) == -1) {
+			warnx("nmount() failed for %s (%s)",
+			    rp, pu->pu_kargp);
 			goto out;
+		}
 	}
 
 	PU_SETSTATE(pu, PUFFS_STATE_RUNNING);
 
  out:
-	if (rv != 0)
+	if (rv != 0) {
+		warnx("puffs_mound failing with %d", errno);
 		sverrno = errno;
-	else
+	} else
 		sverrno = 0;
 	free(pu->pu_kargp);
 	pu->pu_kargp = NULL;

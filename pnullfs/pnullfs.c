@@ -110,10 +110,10 @@ main(int argc, char *argv[])
 
 	if (detach)
 		if (puffs_daemon(pu, 1, 1) == -1)
-			err(1, "puffs_daemon");
+			err(1, "puffs_daemon() failed");
 
 	if (puffs_mount(pu, argv[1], mntflags, pn_root) == -1)
-		err(1, "puffs_mount");
+		err(1, "puffs_mount() failed");
 	if (puffs_mainloop(pu) == -1)
 		err(1, "mainloop");
 
