@@ -41,6 +41,8 @@ __KERNEL_RCSID(0, "$NetBSD: puffs_vnops.c,v 1.131 2008/11/26 20:17:33 pooka Exp 
 #include <sys/namei.h>
 #include <sys/vnode.h>
 #include <sys/proc.h>
+#include <sys/sched.h>
+#include <sys/sf_buf.h>
 #include <sys/systm.h>
 #include <sys/bio.h>
 #include <sys/buf.h>
@@ -416,9 +418,10 @@ puffs_vnop_open(struct vop_open_args *ap)
 	struct vnode *vp = ap->a_vp;
 	struct puffs_node *pn = VPTOPP(vp);
 	struct puffs_mount *pmp = MPTOPUFFSMP(vp->v_mount);
+	struct vattr va;
 	int mode = ap->a_mode;
 	int ltype;
-	int error;
+	int error = 0;
 
 	DPRINTF(("puffs_open: vp %p, mode 0x%x\n", vp, mode));
 
@@ -426,7 +429,7 @@ puffs_vnop_open(struct vop_open_args *ap)
 		return EROFS;
 
 	if (!EXISTSOP(pmp, OPEN))
-		return 0;
+		goto out;
 
 	PUFFS_MSG_ALLOC(vn, open);
 	open_msg->pvnr_mode = mode;
@@ -441,9 +444,16 @@ puffs_vnop_open(struct vop_open_args *ap)
 
 	PUFFS_MSG_RELEASE(open);
 	PUFFS_LOCKVNODE(pn, ltype, error);
+
+out:
 	if (!error) {
-		/* calls VOP_GETATTR */
-		vnode_create_vobject(vp, 0, ap->a_td);
+		error = VOP_GETATTR(vp, &va, ap->a_cred);
+		if (error == 0) {
+			DPRINTF(("puffs_vnop_open: create vobject: vp=%p\n",
+			    vp));
+			/* calls VOP_GETATTR */
+			vnode_create_vobject(vp, va.va_size, ap->a_td);
+		}
 	}
 	return error;
 }
@@ -1311,6 +1321,101 @@ puffs_vnop_rename(struct vop_rename_args *ap)
 	(cont)->pvnr_offset = (offset);					\
 	puffs_credcvt(&(cont)->pvnr_cred, creds)
 
+static inline int
+puffs_ismapped(struct vnode *vp)
+{
+	vm_object_t object = vp->v_object;
+
+	if (object == NULL)
+		return (0);
+
+	return (object->resident_page_count > 0 || object->cache != NULL);
+}
+
+static int
+puffs_mappedread(struct vnode *vp, struct uio *uio)
+{
+	vm_page_t m;
+	vm_offset_t moffset;
+	ssize_t msize;
+	int error = 0;
+
+	moffset = uio->uio_offset & PAGE_MASK;
+	msize = qmin(uio->uio_resid, PAGE_SIZE - moffset);
+
+	ASSERT_VOP_LOCKED(vp, "puffs_mappedread");
+	VM_OBJECT_LOCK(vp->v_object);
+lookupvpg:
+	m = vm_page_lookup(vp->v_object, OFF_TO_IDX(uio->uio_offset));
+	if (m != NULL && vm_page_is_valid(m, moffset, msize)) {
+		if (vm_page_sleep_if_busy(m, FALSE, "puffsmr"))
+			goto lookupvpg;
+		vm_page_busy(m);
+		VM_OBJECT_UNLOCK(vp->v_object);
+		DPRINTF(("puffs_mappedread: offset=0x%jx moffset=0x%jx msize=0x%jx\n",
+		    uio->uio_offset, (intmax_t)moffset, (intmax_t)msize));
+		error = uiomove_fromphys(&m, moffset, msize, uio);
+		VM_OBJECT_LOCK(vp->v_object);
+		vm_page_wakeup(m);
+	} else if (m != NULL && uio->uio_segflg == UIO_NOCOPY) {
+		/* FIXME: UIO_NOCOPY is not supported */
+		error = EIO;
+	}
+	VM_OBJECT_UNLOCK(vp->v_object);
+
+	return (error);
+}
+
+static int
+puffs_mappedwrite(struct vnode *vp, struct uio *uio, char *pagedata)
+{
+	vm_page_t m;
+	vm_pindex_t idx;
+	vm_offset_t moffset;
+	struct sf_buf *sf;
+	ssize_t msize;
+	char *ma;
+	int error = 0;
+
+	moffset = uio->uio_offset & PAGE_MASK;
+	msize = qmin(PAGE_SIZE - moffset, uio->uio_resid);
+
+	ASSERT_VOP_LOCKED(vp, "puffs_mappedwrite");
+	VM_OBJECT_LOCK(vp->v_object);
+lookupvpg:
+	idx = OFF_TO_IDX(uio->uio_offset);
+	m = vm_page_lookup(vp->v_object, idx);
+	if (m != NULL && vm_page_is_valid(m, 0, moffset + msize)) {
+		if (vm_page_sleep_if_busy(m, FALSE, "puffsmw"))
+			goto lookupvpg;
+		vm_page_busy(m);
+		if (moffset == 0) {
+			vm_page_lock_queues();
+			vm_page_undirty(m);
+			vm_page_unlock_queues();
+		}
+		VM_OBJECT_UNLOCK(vp->v_object);
+		DPRINTF(("puffs_mappedwrite: offset=0x%jx moffset=0x%jx msize=0x%jx\n",
+		    uio->uio_offset, (intmax_t)moffset, (intmax_t)msize));
+		sched_pin();
+		sf = sf_buf_alloc(m, SFB_CPUPRIVATE);
+		ma = (char *)sf_buf_kva(sf);
+		error = uiomove(ma + moffset, msize, uio);
+		memcpy(pagedata, ma, msize);
+		sf_buf_free(sf);
+		sched_unpin();
+		VM_OBJECT_LOCK(vp->v_object);
+		vm_page_wakeup(m);
+	} else if (__predict_false(vp->v_object->cache != NULL)) {
+		DPRINTF(("puffs_mappedwrite: free cache: 0x%jx\n",
+		    uio->uio_offset - moffset));
+		vm_page_cache_free(vp->v_object, idx, idx + 1);
+	}
+	VM_OBJECT_UNLOCK(vp->v_object);
+
+	return error;
+}
+
 static int
 puffs_vnop_read(struct vop_read_args *ap)
 {
@@ -1325,6 +1430,7 @@ puffs_vnop_read(struct vop_read_args *ap)
 #endif
 	int error;
 	int ltype;
+	int mapped, vplocked;
 
 	read_msg = NULL;
 	error = 0;
@@ -1356,7 +1462,12 @@ puffs_vnop_read(struct vop_read_args *ap)
 			puffs_updatenode(VPTOPP(vp), PUFFS_UPDATEATIME, 0);
 #endif
 	} else {
-		puffs_unlockvnode(pn, &ltype);
+		mapped = puffs_ismapped(vp);
+		vplocked = 1;
+		if (!mapped) {
+			puffs_unlockvnode(pn, &ltype);
+			vplocked = 0;
+		}
 
 		/*
 		 * in case it's not a regular file or we're operating
@@ -1371,8 +1482,25 @@ puffs_vnop_read(struct vop_read_args *ap)
 
 		error = 0;
 		while (uio->uio_resid > 0) {
+			if (mapped) {
+				tomove = uio->uio_resid;
+				error = puffs_mappedread(vp, uio);
+				if (error)
+					break;
+				if (tomove != uio->uio_resid)
+					continue;
+				/*
+				 * Page lookup failed.
+				 * Unlock vnode and perform uncached read
+				 */
+				puffs_unlockvnode(pn, &ltype);
+				vplocked = 0;
+			}
 			puffs_msgpark_reset(park_read);
 			tomove = PUFFS_TOMOVE(uio->uio_resid, pmp);
+			if (mapped)
+				tomove = MIN(tomove,
+				    PAGE_SIZE - (uio->uio_offset & PAGE_MASK));
 			memset(read_msg, 0, argsize); /* XXX: touser KASSERT */
 			RWARGS(read_msg, ap->a_ioflag, tomove,
 			    uio->uio_offset, ap->a_cred);
@@ -1403,9 +1531,17 @@ puffs_vnop_read(struct vop_read_args *ap)
 			 */
 			if (error || read_msg->pvnr_resid)
 				break;
+			if (mapped) {
+				ASSERT_VOP_UNLOCKED(vp, "puffs_vnop_read");
+				PUFFS_LOCKVNODE(pn, ltype, error);
+				if (error != 0)
+					break;
+				vplocked = 1;
+			}
 		}
 		puffs_msgmem_release(park_read);
-		PUFFS_LOCKVNODE(pn, ltype, error);
+		if (!vplocked)
+			PUFFS_LOCKVNODE(pn, ltype, error);
 	}
 
 	return error;
@@ -1433,6 +1569,8 @@ puffs_vnop_write(struct vop_write_args *ap)
 	size_t bytelen;
 	int ubcflags;
 #endif
+	off_t offset;
+	int mapped, vplocked;
 
 	error = uflags = 0;
 	write_msg = NULL;
@@ -1517,24 +1655,55 @@ puffs_vnop_write(struct vop_write_args *ap)
 		puffs_updatenode(VPTOPP(vp), uflags, vp->v_size);
 #endif
 	} else {
-		puffs_unlockvnode(pn, &ltype);
+		mapped = puffs_ismapped(vp);
+		vplocked = 1;
+		if (!mapped) {
+			puffs_unlockvnode(pn, &ltype);
+			vplocked = 0;
+		}
 
 		/* tomove is non-increasing */
-		tomove = PUFFS_TOMOVE(uio->uio_resid, pmp);
+		/* puffs_mappedwrite expects at least PAGE_SIZE bytes */
+		tomove = PUFFS_TOMOVE(MAX(uio->uio_resid, PAGE_SIZE), pmp);
 		argsize = sizeof(struct puffs_vnmsg_write) + tomove;
 		puffs_msgmem_alloc(argsize, &park_write, (void *)&write_msg,1);
 
 		while (uio->uio_resid > 0) {
 			/* move data to buffer */
+			offset = uio->uio_offset;
 			puffs_msgpark_reset(park_write);
-			tomove = PUFFS_TOMOVE(uio->uio_resid, pmp);
 			memset(write_msg, 0, argsize); /* XXX: touser KASSERT */
-			RWARGS(write_msg, ap->a_ioflag, tomove,
-			    uio->uio_offset, ap->a_cred);
+			if (mapped) {
+				if (!vplocked) {
+					PUFFS_LOCKVNODE(pn, ltype, error);
+					if (error)
+						break;
+					vplocked = 1;
+				}
+				tomove = uio->uio_resid;
+				error = puffs_mappedwrite(vp, uio,
+				    write_msg->pvnr_data);
+				if (error)
+					break;
+				tomove -= uio->uio_resid;
+				MPASS(tomove >= 0 && tomove <= PAGE_SIZE);
+				puffs_unlockvnode(pn, &ltype);
+				vplocked = 0;
+				if (tomove > 0)
+					goto lowerwrite;
+			}
+			tomove = PUFFS_TOMOVE(uio->uio_resid, pmp);
+			if (mapped)
+				tomove = MIN(tomove,
+				    PAGE_SIZE - (offset & PAGE_MASK));
 			error = uiomove(write_msg->pvnr_data, tomove, uio);
 			if (error)
 				break;
 
+lowerwrite:
+			ASSERT_VOP_UNLOCKED(vp, "puffs_mappedwrite");
+			RWARGS(write_msg, ap->a_ioflag, tomove,
+			    offset, ap->a_cred);
 			/* move buffer to userspace */
 			puffs_msg_setinfo(park_write, PUFFSOP_VN,
 			    PUFFS_VN_WRITE, VPTOPNC(vp));
@@ -1558,8 +1727,18 @@ puffs_vnop_write(struct vop_write_args *ap)
 				VM_OBJECT_LOCK(object);
 				osize = object->un_pager.vnp.vnp_size;
 				VM_OBJECT_UNLOCK(object);
-				if (osize < uio->uio_offset)
-					vnode_pager_setsize(vp, uio->uio_offset);
+				if (osize < uio->uio_offset) {
+					PUFFS_LOCKVNODE(pn, ltype, error);
+					if (error)
+						break;
+					vplocked = 1;
+					vnode_pager_setsize(vp,
+					    uio->uio_offset);
+					puffs_unlockvnode(pn, &ltype);
+					vplocked = 0;
+					/* There is no more mapped pages left */
+					mapped = 0;
+				}
 			}
 
 			/* didn't move everything?  bad userspace.  bail */

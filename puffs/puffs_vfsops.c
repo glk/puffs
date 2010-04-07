@@ -380,9 +380,13 @@ puffs_vfsop_statfs(struct mount *mp, struct statfs *sbp)
 	 * is calling mount(2), but mount(2) also calls statvfs.  So
 	 * requesting statvfs from userspace would mean a deadlock.
 	 * Compensate.
+	 * FreeBSD: result of VFS_STATFS ignored by domount, initialize
+	 * mnt_stat with sane data.
 	 */
-	if (pmp->pmp_status == PUFFSTAT_MOUNTING)
-		return EINPROGRESS;
+	if (pmp->pmp_status == PUFFSTAT_MOUNTING) {
+		error = EINPROGRESS;
+		goto out;
+	}
 
 	PUFFS_MSG_ALLOC(vfs, statvfs);
 	puffs_msg_setinfo(park_statvfs, PUFFSOP_VFS, PUFFS_VFS_STATVFS, NULL);
@@ -397,6 +401,7 @@ puffs_vfsop_statfs(struct mount *mp, struct statfs *sbp)
 	 *
 	 * XXX: cache the copy in non-error case
 	 */
+out:
 	if (!error) {
 		struct statfs *rsbp = &statvfs_msg->pvfsr_sb;
 
@@ -419,6 +424,9 @@ puffs_vfsop_statfs(struct mount *mp, struct statfs *sbp)
 		sbp->f_ffree = 0;
 	}
 
+	MPASS(sbp->f_bsize != 0 && sbp->f_iosize != 0);
+
+	/* Ignores park_statvfs == NULL set by PUFFS_MSG_VARS */
 	PUFFS_MSG_RELEASE(statvfs);
 	return error;
 }
