@@ -1,4 +1,4 @@
-/*	$NetBSD: opdump.c,v 1.27 2009/04/06 20:47:17 pooka Exp $	*/
+/*	$NetBSD: opdump.c,v 1.30 2010/01/07 22:46:11 pooka Exp $	*/
 
 /*
  * Copyright (c) 2005, 2006  Antti Kantee.  All Rights Reserved.
@@ -35,7 +35,7 @@
 
 #include <sys/cdefs.h>
 #if !defined(lint)
-__RCSID("$NetBSD: opdump.c,v 1.27 2009/04/06 20:47:17 pooka Exp $");
+__RCSID("$NetBSD: opdump.c,v 1.30 2010/01/07 22:46:11 pooka Exp $");
 #endif /* !lint */
 
 #include <sys/types.h>
@@ -46,6 +46,8 @@ __RCSID("$NetBSD: opdump.c,v 1.27 2009/04/06 20:47:17 pooka Exp $");
 #include <stdio.h>
 
 #include "puffs_priv.h"
+
+#define DINT "    "
 
 /* XXX! */
 const char *vfsop_revmap[] = {
@@ -145,7 +147,7 @@ puffsdump_req(struct puffs_req *preq)
 	const char **map;
 	int isvn = 0;
 
-	map = NULL; /* yes, we are all interested in your opinion, gcc */
+	printf("reqid: %" PRIu64 ", ", preq->preq_id);
 	switch (PUFFSOP_OPCLASS(preq->preq_opclass)) {
 	case PUFFSOP_VFS:
 		map = vfsop_revmap;
@@ -163,11 +165,14 @@ puffsdump_req(struct puffs_req *preq)
 	case PUFFSOP_FLUSH:
 		map = flush_revmap;
 		break;
+	default:
+		printf("unhandled opclass\n");
+		return;
 	}
 
-	printf("\treqid: %" PRIu64 ", opclass %d%s, optype: %s, "
-	    "cookie: %p,\n\t\taux: %p, auxlen: %zu, pid: %d, lwpid: %d\n",
-	    preq->preq_id, PUFFSOP_OPCLASS(preq->preq_opclass),
+	printf("opclass %d%s, optype: %s, "
+	    "cookie: %p,\n" DINT "aux: %p, auxlen: %zu, pid: %d, lwpid: %d\n",
+	    PUFFSOP_OPCLASS(preq->preq_opclass),
 	    PUFFSOP_WANTREPLY(preq->preq_opclass) ? "" : " (FAF)",
 	    map[preq->preq_optype], preq->preq_cookie,
 	    preq->preq_buf, preq->preq_buflen,
@@ -193,15 +198,24 @@ puffsdump_req(struct puffs_req *preq)
 		case PUFFS_VN_READDIR:
 			puffsdump_readdir(preq);
 			break;
+		case PUFFS_VN_CREATE:
+		case PUFFS_VN_MKDIR:
+		case PUFFS_VN_MKNOD:
+		case PUFFS_VN_SYMLINK:
+			puffsdump_create(preq);
+			break;
+		case PUFFS_VN_SETATTR:
+			puffsdump_attr(preq);
+			break;
 		default:
 			break;
 		}
 	}
-	
+
 	PU_LOCK();
 	gettimeofday(&tv_now, NULL);
 	timersub(&tv_now, &tv_prev, &tv);
-	printf("\t\tsince previous call: %lld.%06ld\n",
+	printf(DINT "since previous call: %lld.%06ld\n",
 	    (long long)tv.tv_sec, (long)tv.tv_usec);
 	gettimeofday(&tv_prev, NULL);
 	PU_UNLOCK();
@@ -229,21 +243,155 @@ puffsdump_rv(struct puffs_req *preq)
 		case PUFFS_VN_READDIR:
 			puffsdump_readdir_rv(preq);
 			break;
+		case PUFFS_VN_GETATTR:
+			puffsdump_attr(preq);
+			break;
 		default:
 			break;
 		}
 	}
 
-	printf("\tRV reqid: %" PRIu64 ", result: %d %s\n",
+	printf("RV reqid: %" PRIu64 ", result: %d %s\n",
 	    preq->preq_id, preq->preq_rv,
 	    preq->preq_rv ? strerror(preq->preq_rv) : "");
+}
+
+/*
+ * Slightly tedious print-routine so that we get a nice NOVAL instead
+ * of some tedious output representations for -1, especially (uint64_t)-1
+ *
+ * We use typecasting to make this work beyond time_t/dev_t size changes.
+ */
+static void
+dumpattr(struct vattr *vap)
+{
+	const char * const vtypes[] = { VNODE_TYPES };
+	char buf[128];
+
+/* XXX: better readability.  and this is debug, so no cycle-sweat */
+#define DEFAULTBUF() snprintf(buf, sizeof(buf), "NOVAL")
+
+	printf(DINT "vattr:\n");
+	printf(DINT DINT "type: %s, ", vtypes[vap->va_type]);
+
+	DEFAULTBUF();
+	if (vap->va_mode != (mode_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "0%o", vap->va_mode);
+	printf("mode: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_nlink != (nlink_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%d", vap->va_nlink);
+	printf("nlink: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_uid != (uid_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%d", vap->va_uid);
+	printf("uid: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_gid != (gid_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%d", vap->va_gid);
+	printf("gid: %s\n", buf);
+
+	DEFAULTBUF();
+	if (vap->va_fsid != (dev_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "0x%llx",
+		    (unsigned long long)vap->va_fsid);
+	printf(DINT DINT "fsid: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_fileid != (ino_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%" PRIu64, vap->va_fileid);
+	printf("ino: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_size != (u_quad_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%" PRIu64, vap->va_size);
+	printf("size: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_blocksize != (long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%ld", vap->va_blocksize);
+	printf("bsize: %s\n", buf);
+
+	DEFAULTBUF();
+	if (vap->va_atime.tv_sec != (time_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%lld",
+		    (long long)vap->va_atime.tv_sec);
+	printf(DINT DINT "a.s: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_atime.tv_nsec != (long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%ld", vap->va_atime.tv_nsec);
+	printf("a.ns: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_mtime.tv_sec != (time_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%lld",
+		    (long long)vap->va_mtime.tv_sec);
+	printf("m.s: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_mtime.tv_nsec != (long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%ld", vap->va_mtime.tv_nsec);
+	printf("m.ns: %s\n", buf);
+
+	DEFAULTBUF();
+	if (vap->va_ctime.tv_sec != (time_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%lld",
+		    (long long)vap->va_ctime.tv_sec);
+	printf(DINT DINT "c.s: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_ctime.tv_nsec != (long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%ld", vap->va_ctime.tv_nsec);
+	printf("c.ns: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_birthtime.tv_sec != (time_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%lld",
+		    (long long)vap->va_birthtime.tv_sec);
+	printf("b.s: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_birthtime.tv_nsec != (long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%ld", vap->va_birthtime.tv_nsec);
+	printf("b.ns: %s\n", buf);
+
+	DEFAULTBUF();
+	if (vap->va_gen != (u_long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%lu", vap->va_gen);
+	printf(DINT DINT "gen: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_flags != (u_long)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "0x%lx", vap->va_flags);
+	printf("flags: %s, ", buf);
+
+	DEFAULTBUF();
+	if (vap->va_rdev != (dev_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "0x%llx",
+		    (unsigned long long)vap->va_rdev);
+	printf("rdev: %s\n", buf);
+
+	DEFAULTBUF();
+	if (vap->va_bytes != (u_quad_t)PUFFS_VNOVAL)
+		snprintf(buf, sizeof(buf), "%" PRIu64, vap->va_bytes);
+	printf(DINT DINT "bytes: %s, ", buf);
+
+	snprintf(buf, sizeof(buf), "%" PRIu64, vap->va_filerev);
+	printf("filerev: %s, ", buf);
+
+	snprintf(buf, sizeof(buf), "0x%x", vap->va_vaflags);
+	printf("vaflags: %s\n", buf);
 }
 
 void
 puffsdump_cookie(puffs_cookie_t c, const char *cookiename)
 {
 	
-	printf("\t%scookie: at %p\n", cookiename, c);
+	printf("%scookie: at %p\n", cookiename, c);
 }
 
 static const char *cn_opnames[] = {
@@ -257,7 +405,7 @@ void
 puffsdump_cn(struct puffs_kcn *pkcn)
 {
 
-	printf("\t\tpuffs_cn: \"%s\", len %zu op %s (flags 0x%x)\n",
+	printf(DINT "puffs_cn: \"%s\", len %zu op %s (flags 0x%x)\n",
 	    pkcn->pkcn_name, pkcn->pkcn_namelen,
 	    cn_opnames[pkcn->pkcn_nameiop & NAMEI_OPMASK],
 	    pkcn->pkcn_flags);
@@ -276,9 +424,18 @@ puffsdump_lookup_rv(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_lookup *lookup_msg = (void *)preq;
 
-	printf("\t\tnew node %p, type 0x%x,\n\t\tsize 0x%"PRIu64", dev 0x%llx\n",
+	printf(DINT "new %p, type 0x%x, size 0x%"PRIu64", dev 0x%llx\n",
 	    lookup_msg->pvnr_newnode, lookup_msg->pvnr_vtype,
 	    lookup_msg->pvnr_size, (unsigned long long)lookup_msg->pvnr_rdev);
+}
+
+void
+puffsdump_create(struct puffs_req *preq)
+{
+	/* XXX: wrong type, but we know it fits the slot */
+	struct puffs_vnmsg_create *create_msg = (void *)preq;
+	
+	dumpattr(&create_msg->pvnr_va);
 }
 
 void
@@ -287,7 +444,7 @@ puffsdump_create_rv(struct puffs_req *preq)
 	/* XXX: wrong type, but we know it fits the slot */
 	struct puffs_vnmsg_create *create_msg = (void *)preq;
 
-	printf("\t\tnew node %p\n", create_msg->pvnr_newnode);
+	printf(DINT "new %p\n", create_msg->pvnr_newnode);
 }
 
 void
@@ -295,7 +452,7 @@ puffsdump_readwrite(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_rw *rw_msg = (void *)preq;
 
-	printf("\t\toffset: %" PRId64 ", resid %zu, ioflag 0x%x\n",
+	printf(DINT "offset: %" PRId64 ", resid %zu, ioflag 0x%x\n",
 	    rw_msg->pvnr_offset, rw_msg->pvnr_resid, rw_msg->pvnr_ioflag);
 }
 
@@ -304,7 +461,7 @@ puffsdump_readwrite_rv(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_rw *rw_msg = (void *)preq;
 
-	printf("\t\tresid after op: %zu\n", rw_msg->pvnr_resid);
+	printf(DINT "resid after op: %zu\n", rw_msg->pvnr_resid);
 }
 
 void
@@ -312,7 +469,7 @@ puffsdump_readdir_rv(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_readdir *readdir_msg = (void *)preq;
 
-	printf("\t\tresid after op: %zu, eofflag %d\n",
+	printf(DINT "resid after op: %zu, eofflag %d\n",
 	    readdir_msg->pvnr_resid, readdir_msg->pvnr_eofflag);
 }
 
@@ -321,7 +478,7 @@ puffsdump_open(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_open *open_msg = (void *)preq;
 
-	printf("\t\tmode: 0x%x\n", open_msg->pvnr_mode);
+	printf(DINT "mode: 0x%x\n", open_msg->pvnr_mode);
 }
 
 void
@@ -329,7 +486,7 @@ puffsdump_targ(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_remove *remove_msg = (void *)preq; /* XXX! */
 
-	printf("\t\ttarget cookie: %p\n", remove_msg->pvnr_cookie_targ);
+	printf(DINT "target cookie: %p\n", remove_msg->pvnr_cookie_targ);
 }
 
 void
@@ -337,19 +494,13 @@ puffsdump_readdir(struct puffs_req *preq)
 {
 	struct puffs_vnmsg_readdir *readdir_msg = (void *)preq;
 
-	printf("\t\tread offset: %" PRId64 "\n", readdir_msg->pvnr_offset);
+	printf(DINT "read offset: %" PRId64 "\n", readdir_msg->pvnr_offset);
 }
 
 void
-/*ARGSUSED*/
-puffsdump_creds(struct puffs_cred *pcr)
+puffsdump_attr(struct puffs_req *preq)
 {
+	struct puffs_vnmsg_setgetattr *attr_msg = (void *)preq;
 
-}
-
-void
-puffsdump_int(int value, const char *name)
-{
-
-	printf("\tint (%s): %d\n", name, value);
+	dumpattr(&attr_msg->pvnr_va);
 }

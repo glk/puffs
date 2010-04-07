@@ -1,4 +1,4 @@
-/*	$NetBSD: puffs.c,v 1.98 2009/01/08 02:28:08 lukem Exp $	*/
+/*	$NetBSD: puffs.c,v 1.105 2010/01/12 18:42:38 pooka Exp $	*/
 
 /*
  * Copyright (c) 2005, 2006, 2007  Antti Kantee.  All Rights Reserved.
@@ -31,7 +31,7 @@
 
 #include <sys/cdefs.h>
 #if !defined(lint)
-__RCSID("$NetBSD: puffs.c,v 1.98 2009/01/08 02:28:08 lukem Exp $");
+__RCSID("$NetBSD: puffs.c,v 1.105 2010/01/12 18:42:38 pooka Exp $");
 #endif /* !lint */
 
 #include <sys/param.h>
@@ -99,6 +99,7 @@ fillvnopmask(struct puffs_ops *pops, uint8_t *opmask)
 	FILLOP(print,    PRINT);
 	FILLOP(read,     READ);
 	FILLOP(write,    WRITE);
+	FILLOP(abortop,  ABORTOP);
 }
 #undef FILLOP
 
@@ -120,14 +121,24 @@ finalpush(struct puffs_usermount *pu)
 }
 
 /*ARGSUSED*/
-static void
-puffs_defaulterror(struct puffs_usermount *pu, uint8_t type,
+void
+puffs_kernerr_abort(struct puffs_usermount *pu, uint8_t type,
 	int error, const char *str, puffs_cookie_t cookie)
 {
 
 	fprintf(stderr, "abort: type %d, error %d, cookie %p (%s)\n",
 	    type, error, cookie, str);
 	abort();
+}
+
+/*ARGSUSED*/
+void
+puffs_kernerr_log(struct puffs_usermount *pu, uint8_t type,
+	int error, const char *str, puffs_cookie_t cookie)
+{
+
+	syslog(LOG_WARNING, "kernel: type %d, error %d, cookie %p (%s)\n",
+	    type, error, cookie, str);
 }
 
 int
@@ -143,7 +154,7 @@ puffs__nextreq(struct puffs_usermount *pu)
 	uint64_t rv;
 
 	PU_LOCK();
-	rv = pu->pu_nextreq++;
+	rv = pu->pu_nextreq++ | (uint64_t)1<<63;
 	PU_UNLOCK();
 
 	return rv;
@@ -273,6 +284,18 @@ puffs_setspecific(struct puffs_usermount *pu, void *privdata)
 {
 
 	pu->pu_privdata = privdata;
+}
+
+void
+puffs_setmntinfo(struct puffs_usermount *pu,
+	const char *mntfromname, const char *puffsname)
+{
+	struct puffs_kargs *pargs = pu->pu_kargp;
+
+	(void)strlcpy(pargs->pa_mntfromname, mntfromname,
+	    sizeof(pargs->pa_mntfromname));
+	(void)strlcpy(pargs->pa_typename, puffsname,
+	    sizeof(pargs->pa_typename));
 }
 
 size_t
@@ -586,20 +609,21 @@ do {									\
 	return rv;
 }
 
+/*ARGSUSED*/
 struct puffs_usermount *
-_puffs_init(int develv, struct puffs_ops *pops, const char *mntfromname,
+_puffs_init(int dummy, struct puffs_ops *pops, const char *mntfromname,
 	const char *puffsname, void *priv, uint32_t pflags)
 {
 	struct puffs_usermount *pu;
 	struct puffs_kargs *pargs;
 	int sverrno;
 
-	if (develv != PUFFS_DEVEL_LIBVERSION) {
-		warnx("puffs_init: mounting with lib version %d, need %d",
-		    develv, PUFFS_DEVEL_LIBVERSION);
-		errno = EINVAL;
-		return NULL;
-	}
+	if (puffsname == PUFFS_DEFER)
+		puffsname = "n/a";
+	if (mntfromname == PUFFS_DEFER)
+		mntfromname = "n/a";
+	if (priv == PUFFS_DEFER)
+		priv = NULL;
 
 	pu = malloc(sizeof(struct puffs_usermount));
 	if (pu == NULL)
@@ -614,10 +638,7 @@ _puffs_init(int develv, struct puffs_ops *pops, const char *mntfromname,
 	pargs->pa_vers = PUFFSDEVELVERS | PUFFSVERSION;
 	pargs->pa_flags = PUFFS_FLAG_KERN(pflags);
 	fillvnopmask(pops, pargs->pa_vnopmask);
-	(void)strlcpy(pargs->pa_typename, puffsname,
-	    sizeof(pargs->pa_typename));
-	(void)strlcpy(pargs->pa_mntfromname, mntfromname,
-	    sizeof(pargs->pa_mntfromname));
+	puffs_setmntinfo(pu, mntfromname, puffsname);
 
 	puffs_zerostatvfs(&pargs->pa_svfsb);
 	pargs->pa_root_cookie = NULL;
@@ -653,7 +674,7 @@ _puffs_init(int develv, struct puffs_ops *pops, const char *mntfromname,
 	pu->pu_pathtransform = NULL;
 	pu->pu_namemod = NULL;
 
-	pu->pu_errnotify = puffs_defaulterror;
+	pu->pu_errnotify = puffs_kernerr_log;
 
 	PU_SETSTATE(pu, PUFFS_STATE_BEFOREMOUNT);
 
@@ -676,33 +697,61 @@ puffs_cancel(struct puffs_usermount *pu, int error)
 	free(pu);
 }
 
-/*
- * XXX: there's currently no clean way to request unmount from
- * within the user server, so be very brutal about it.
- */
 /*ARGSUSED1*/
 int
-puffs_exit(struct puffs_usermount *pu, int force)
+puffs_exit(struct puffs_usermount *pu, int unused /* strict compat */)
 {
-	struct puffs_node *pn;
+	struct puffs_framebuf *pb;
+	struct puffs_req *preq;
+	void *winp;
+	size_t winlen;
+	int sverrno;
 
-	force = 1; /* currently */
-	assert((pu->pu_state & PU_PUFFSDAEMON) == 0);
+	pb = puffs_framebuf_make();
+	if (pb == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
 
-	if (pu->pu_fd)
-		close(pu->pu_fd);
+	winlen = sizeof(struct puffs_req);
+	if (puffs_framebuf_getwindow(pb, 0, &winp, &winlen) == -1) {
+		sverrno = errno;
+		puffs_framebuf_destroy(pb);
+		errno = sverrno;
+		return -1;
+	}
+	preq = winp;
 
-	while ((pn = LIST_FIRST(&pu->pu_pnodelst)) != NULL)
-		puffs_pn_put(pn);
+	preq->preq_buflen = sizeof(struct puffs_req);
+	preq->preq_opclass = PUFFSOP_UNMOUNT;
+	preq->preq_id = puffs__nextreq(pu);
 
-	finalpush(pu);
-	puffs__framev_exit(pu);
-	puffs__cc_exit(pu);
-	if (pu->pu_state & PU_HASKQ)
-		close(pu->pu_kq);
-	free(pu);
+	puffs_framev_enqueue_justsend(pu, puffs_getselectable(pu), pb, 1, 0);
 
-	return 0; /* always succesful for now, WILL CHANGE */
+	return 0;
+}
+
+/* no sigset_t static intializer */
+static int sigs[NSIG] = { 0, };
+static int sigcatch = 0;
+
+int
+puffs_unmountonsignal(int sig, bool sigignore)
+{
+
+	if (sig < 0 || sig >= (int)NSIG) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (sigignore)
+		if (signal(sig, SIG_IGN) == SIG_ERR)
+			return -1;
+
+	if (!sigs[sig])
+		sigcatch++;
+	sigs[sig] = 1;
+
+	return 0;
 }
 
 /*
@@ -721,6 +770,7 @@ puffs__theloop(struct puffs_cc *pcc)
 	int ndone;
 
 	while (puffs_getstate(pu) != PUFFS_STATE_UNMOUNTED) {
+
 		/*
 		 * Schedule existing requests.
 		 */
@@ -793,11 +843,10 @@ puffs__theloop(struct puffs_cc *pcc)
 				fio->stat &= ~FIO_WR;
 				nchanges++;
 			}
-			assert(nchanges <= pu->pu_nfds);
 		}
 
 		ndone = kevent(pu->pu_kq, pu->pu_evs, nchanges,
-		    pu->pu_evs, 2*pu->pu_nfds, pu->pu_ml_timep);
+		    pu->pu_evs, pu->pu_nevs, pu->pu_ml_timep);
 
 		if (ndone == -1) {
 			if (errno != EINTR)
@@ -824,7 +873,10 @@ puffs__theloop(struct puffs_cc *pcc)
 #endif
 
 			fio = (void *)curev->udata;
-			pfctrl = fio->fctrl;
+			if (__predict_true(fio))
+				pfctrl = fio->fctrl;
+			else
+				pfctrl = NULL;
 			if (curev->flags & EV_ERROR) {
 				assert(curev->filter == EVFILT_WRITE);
 				fio->stat &= ~FIO_WR;
@@ -846,6 +898,13 @@ puffs__theloop(struct puffs_cc *pcc)
 				puffs__framev_output(pu, pfctrl, fio);
 				what |= PUFFS_FBIO_WRITE;
 			}
+
+			else if (__predict_false(curev->filter==EVFILT_SIGNAL)){
+				if ((pu->pu_state & PU_DONEXIT) == 0) {
+					PU_SETSFLAG(pu, PU_DONEXIT);
+					puffs_exit(pu, 0);
+				}
+			}
 			if (what)
 				puffs__framev_notify(fio, what);
 		}
@@ -863,14 +922,14 @@ puffs__theloop(struct puffs_cc *pcc)
 	if (puffs__cc_restoremain(pu) == -1)
 		warn("cannot restore main context.  impending doom");
 }
-
 int
 puffs_mainloop(struct puffs_usermount *pu)
 {
 	struct puffs_fctrl_io *fio;
 	struct puffs_cc *pcc;
 	struct kevent *curev;
-	int sverrno;
+	size_t nevs;
+	int sverrno, i;
 
 	assert(puffs_getstate(pu) >= PUFFS_STATE_RUNNING);
 
@@ -885,10 +944,12 @@ puffs_mainloop(struct puffs_usermount *pu)
 	    &pu->pu_framectrl[PU_FRAMECTRL_FS]) == -1)
 		goto out;
 
-	curev = realloc(pu->pu_evs, (2*pu->pu_nfds)*sizeof(struct kevent));
+	nevs = pu->pu_nevs + sigcatch;
+	curev = realloc(pu->pu_evs, nevs * sizeof(struct kevent));
 	if (curev == NULL)
 		goto out;
 	pu->pu_evs = curev;
+	pu->pu_nevs = nevs;
 
 	LIST_FOREACH(fio, &pu->pu_ios, fio_entries) {
 		EV_SET(curev, fio->io_fd, EVFILT_READ, EV_ADD,
@@ -898,7 +959,15 @@ puffs_mainloop(struct puffs_usermount *pu)
 		    0, 0, (uintptr_t)fio);
 		curev++;
 	}
-	if (kevent(pu->pu_kq, pu->pu_evs, 2*pu->pu_nfds, NULL, 0, NULL) == -1)
+	for (i = 0; i < NSIG; i++) {
+		if (sigs[i]) {
+			EV_SET(curev, i, EVFILT_SIGNAL, EV_ADD | EV_ENABLE,
+			    0, 0, 0);
+			curev++;
+		}
+	}
+	assert(curev - pu->pu_evs == (ssize_t)pu->pu_nevs);
+	if (kevent(pu->pu_kq, pu->pu_evs, pu->pu_nevs, NULL, 0, NULL) == -1)
 		goto out;
 
 	pu->pu_state |= PU_INLOOP;

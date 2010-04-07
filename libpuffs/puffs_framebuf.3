@@ -1,4 +1,4 @@
-.\"	$NetBSD: puffs_framebuf.3,v 1.26 2009/02/20 14:26:56 pooka Exp $
+.\"	$NetBSD: puffs_framebuf.3,v 1.29 2010/04/01 09:57:00 pooka Exp $
 .\"
 .\" Copyright (c) 2007 Antti Kantee.  All rights reserved.
 .\"
@@ -89,7 +89,7 @@
 .Fc
 .Ft void
 .Fo puffs_framev_enqueue_justsend
-.Fa "struct puffs_usermount *pu" "int fd "struct puffs_framebuf *pufbuf"
+.Fa "struct puffs_usermount *pu" "int fd" "struct puffs_framebuf *pufbuf"
 .Fa "int waitreply" "int flags"
 .Fc
 .Ft void
@@ -210,7 +210,7 @@ One option is to make the descriptors non-blocking before adding them.
 .It rfb
 Read a frame from the file descriptor onto the specified buffer.
 .It wfb
-Write a frame from the the specified buffer into the file descriptor.
+Write a frame from the specified buffer into the file descriptor.
 .It cmpfb
 Identify if a buffer is the response to the specified buffer.
 .It gotfb
@@ -546,12 +546,12 @@ combination of
 and
 .Dv PUFFS_FBIO_WRITE .
 If not specified, the descriptor will be in a disabled state.
-.It Fn puffs_framev_enablefd pu fd error
+.It Fn puffs_framev_enablefd pu fd what
 Enable events of type
 .Ar what
 for file descriptor
 .Ar fd .
-.It Fn puffs_framev_disablefd pu fd error
+.It Fn puffs_framev_disablefd pu fd what
 Disable events of type
 .Ar what
 for file descriptor

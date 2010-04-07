@@ -1,4 +1,4 @@
-/*	$NetBSD: node.c,v 1.58 2009/05/20 14:08:21 pooka Exp $	*/
+/*	$NetBSD: node.c,v 1.61 2010/04/01 02:34:09 pooka Exp $	*/
 
 /*
  * Copyright (c) 2006-2009  Antti Kantee.  All Rights Reserved.
@@ -27,7 +27,7 @@
 
 #include <sys/cdefs.h>
 #ifndef lint
-__RCSID("$NetBSD: node.c,v 1.58 2009/05/20 14:08:21 pooka Exp $");
+__RCSID("$NetBSD: node.c,v 1.61 2010/04/01 02:34:09 pooka Exp $");
 #endif /* !lint */
 
 #include <assert.h>
@@ -90,7 +90,17 @@ psshfs_node_lookup(struct puffs_usermount *pu, puffs_cookie_t opc,
 		if (pd->entry)
 			pn = pd->entry;
 		else
-			pn = makenode(pu, pn_dir, pd, &pd->va);
+			pd->entry = pn = makenode(pu, pn_dir, pd, &pd->va);
+
+		/*
+		 * sure sure we have fresh attributes.  most likely we will
+		 * have them cached.  we might not if we go through:
+		 * create - reclaim - lookup (this).
+		 */
+		rv = getnodeattr(pu, pn, PCNPATH(pcn));
+		if (rv)
+			return rv;
+
 		psn = pn->pn_data;
 	}
 
@@ -110,7 +120,7 @@ psshfs_node_getattr(struct puffs_usermount *pu, puffs_cookie_t opc,
 	struct puffs_node *pn = opc;
 	int rv;
 
-	rv = getnodeattr(pu, pn);
+	rv = getnodeattr(pu, pn, NULL);
 	if (rv)
 		return rv;
 
@@ -147,7 +157,7 @@ psshfs_node_setattr(struct puffs_usermount *pu, puffs_cookie_t opc,
 			kludgeva.va_atime.tv_sec = va->va_mtime.tv_sec;
 	}
 			
-	psbuf_put_vattr(pb, &kludgeva);
+	psbuf_put_vattr(pb, &kludgeva, pctx);
 	GETRESPONSE(pb, pctx->sshfd);
 
 	rv = psbuf_expect_status(pb);
@@ -172,7 +182,7 @@ psshfs_node_create(struct puffs_usermount *pu, puffs_cookie_t opc,
 	/* Create node on server first */
 	psbuf_req_str(pb, SSH_FXP_OPEN, reqid, PCNPATH(pcn));
 	psbuf_put_4(pb, SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC);
-	psbuf_put_vattr(pb, va);
+	psbuf_put_vattr(pb, va, pctx);
 	GETRESPONSE(pb, pctx->sshfd);
 	rv = psbuf_expect_handle(pb, &fhand, &fhandlen);
 	if (rv)
@@ -246,7 +256,7 @@ psshfs_node_open(struct puffs_usermount *pu, puffs_cookie_t opc, int mode,
 		reqid = NEXTREQ(pctx);
 		psbuf_req_str(pb, SSH_FXP_OPEN, reqid, PNPATH(pn));
 		psbuf_put_4(pb, SSH_FXF_READ);
-		psbuf_put_vattr(pb, &va);
+		psbuf_put_vattr(pb, &va, pctx);
 
 		if (puffs_framev_enqueue_cb(pu, pctx->sshfd_data, pb,
 		    lazyopen_rresp, psn, 0) == -1) {
@@ -264,7 +274,7 @@ psshfs_node_open(struct puffs_usermount *pu, puffs_cookie_t opc, int mode,
 		reqid = NEXTREQ(pctx);
 		psbuf_req_str(pb2, SSH_FXP_OPEN, reqid, PNPATH(pn));
 		psbuf_put_4(pb2, SSH_FXF_WRITE);
-		psbuf_put_vattr(pb2, &va);
+		psbuf_put_vattr(pb2, &va, pctx);
 
 		if (puffs_framev_enqueue_cb(pu, pctx->sshfd_data, pb2,
 		    lazyopen_wresp, psn, 0) == -1) {
@@ -332,7 +342,8 @@ psshfs_node_readdir(struct puffs_usermount *pu, puffs_cookie_t opc,
 	struct puffs_node *pn = opc;
 	struct psshfs_node *psn = pn->pn_data;
 	struct psshfs_dir *pd;
-	int i, rv, set_readdir;
+	size_t i;
+	int rv, set_readdir;
 
  restart:
 	if (psn->stat & PSN_READDIR) {
@@ -580,7 +591,7 @@ psshfs_node_write(struct puffs_usermount *pu, puffs_cookie_t opc, uint8_t *buf,
 	if (rv == 0)
 		*resid = 0;
 
-	if (pn->pn_va.va_size < offset + writelen)
+	if (pn->pn_va.va_size < (uint64_t)offset + writelen)
 		pn->pn_va.va_size = offset + writelen;
 
  out:
@@ -714,7 +725,7 @@ psshfs_node_mkdir(struct puffs_usermount *pu, puffs_cookie_t opc,
 	struct puffs_node *pn_new;
 
 	psbuf_req_str(pb, SSH_FXP_MKDIR, reqid, PCNPATH(pcn));
-	psbuf_put_vattr(pb, va);
+	psbuf_put_vattr(pb, va, pctx);
 	GETRESPONSE(pb, pctx->sshfd);
 
 	rv = psbuf_expect_status(pb);

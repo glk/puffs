@@ -1,4 +1,4 @@
-/*	$NetBSD: fs.c,v 1.20 2009/05/20 14:08:21 pooka Exp $	*/
+/*	$NetBSD: fs.c,v 1.22 2010/04/01 02:34:09 pooka Exp $	*/
 
 /*
  * Copyright (c) 2006-2009  Antti Kantee.  All Rights Reserved.
@@ -27,7 +27,7 @@
 
 #include <sys/cdefs.h>
 #ifndef lint
-__RCSID("$NetBSD: fs.c,v 1.20 2009/05/20 14:08:21 pooka Exp $");
+__RCSID("$NetBSD: fs.c,v 1.22 2010/04/01 02:34:09 pooka Exp $");
 #endif /* !lint */
 
 #include <err.h>
@@ -211,6 +211,9 @@ psshfs_fs_statvfs(struct puffs_usermount *pu, struct statvfs *sbp)
 	psbuf_get_8(pb, &tmpval);
 	sbp->f_namemax = tmpval;
 
+	sbp->f_bresvd = sbp->f_bfree - sbp->f_bavail;
+	sbp->f_fresvd = sbp->f_ffree - sbp->f_favail;
+
  out:
 	PSSHFSRETURN(rv);
 }
@@ -266,7 +269,7 @@ psshfs_fs_fhtonode(struct puffs_usermount *pu, void *fid, size_t fidsize,
 		return EINVAL;
 
 	/* update node attributes */
-	rv = getnodeattr(pu, pn);
+	rv = getnodeattr(pu, pn, NULL);
 	if (rv)
 		return EINVAL;
 

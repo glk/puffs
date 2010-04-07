@@ -1,4 +1,4 @@
-/*	$NetBSD: psshfs.c,v 1.54 2009/05/20 15:04:36 pooka Exp $	*/
+/*	$NetBSD: psshfs.c,v 1.61 2010/02/17 15:54:10 pooka Exp $	*/
 
 /*
  * Copyright (c) 2006-2009  Antti Kantee.  All Rights Reserved.
@@ -41,7 +41,7 @@
 
 #include <sys/cdefs.h>
 #ifndef lint
-__RCSID("$NetBSD: psshfs.c,v 1.54 2009/05/20 15:04:36 pooka Exp $");
+__RCSID("$NetBSD: psshfs.c,v 1.61 2010/02/17 15:54:10 pooka Exp $");
 #endif /* !lint */
 
 #include <sys/types.h>
@@ -64,7 +64,7 @@ __RCSID("$NetBSD: psshfs.c,v 1.54 2009/05/20 15:04:36 pooka Exp $");
 static int	pssh_connect(struct puffs_usermount *, int);
 static void	psshfs_loopfn(struct puffs_usermount *);
 static void	usage(void);
-static void	add_ssharg(char ***, int *, char *);
+static void	add_ssharg(char ***, int *, const char *);
 static void	psshfs_notify(struct puffs_usermount *, int, int);
 
 #define SSH_PATH "/usr/bin/ssh"
@@ -73,13 +73,13 @@ unsigned int max_reads;
 static int sighup;
 
 static void
-add_ssharg(char ***sshargs, int *nargs, char *arg)
+add_ssharg(char ***sshargs, int *nargs, const char *arg)
 {
 	
 	*sshargs = realloc(*sshargs, (*nargs + 2) * sizeof(char*));
 	if (!*sshargs)
 		err(1, "realloc");
-	(*sshargs)[(*nargs)++] = arg;
+	(*sshargs)[(*nargs)++] = estrdup(arg);
 	(*sshargs)[*nargs] = NULL;
 }
 
@@ -121,10 +121,13 @@ main(int argc, char *argv[])
 	int nargs;
 
 	setprogname(argv[0]);
+	puffs_unmountonsignal(SIGINT, true);
+	puffs_unmountonsignal(SIGTERM, true);
 
 	if (argc < 3)
 		usage();
 
+	memset(&pctx, 0, sizeof(pctx));
 	mntflags = pflags = exportfs = nargs = 0;
 	numconnections = 1;
 	detach = 1;
@@ -135,7 +138,7 @@ main(int argc, char *argv[])
 	add_ssharg(&sshargs, &nargs, "-axs");
 	add_ssharg(&sshargs, &nargs, "-oClearAllForwardings=yes");
 
-	while ((ch = getopt(argc, argv, "c:eF:o:O:pr:st:")) != -1) {
+	while ((ch = getopt(argc, argv, "c:eF:g:o:O:pr:st:u:")) != -1) {
 		switch (ch) {
 		case 'c':
 			numconnections = atoi(optarg);
@@ -152,6 +155,13 @@ main(int argc, char *argv[])
 		case 'F':
 			add_ssharg(&sshargs, &nargs, "-F");
 			add_ssharg(&sshargs, &nargs, optarg);
+			break;
+		case 'g':
+			pctx.domanglegid = 1;
+			pctx.manglegid = atoi(optarg);
+			if (pctx.manglegid == (gid_t)-1)
+				errx(1, "-1 not allowed for -g");
+			pctx.mygid = getegid();
 			break;
 		case 'O':
 			add_ssharg(&sshargs, &nargs, "-o");
@@ -176,6 +186,13 @@ main(int argc, char *argv[])
 			refreshival = atoi(optarg);
 			if (refreshival < 0 && refreshival != -1)
 				errx(1, "invalid timeout %d", refreshival);
+			break;
+		case 'u':
+			pctx.domangleuid = 1;
+			pctx.mangleuid = atoi(optarg);
+			if (pctx.mangleuid == (uid_t)-1)
+				errx(1, "-1 not allowed for -u");
+			pctx.myuid = geteuid();
 			break;
 		default:
 			usage();
@@ -222,7 +239,6 @@ main(int argc, char *argv[])
 	if (pu == NULL)
 		err(1, "puffs_init");
 
-	memset(&pctx, 0, sizeof(pctx));
 	pctx.mounttime = time(NULL);
 	pctx.refreshival = refreshival;
 	pctx.numconnections = numconnections;
@@ -271,7 +287,15 @@ main(int argc, char *argv[])
 
 	rva = &pn_root->pn_va;
 	rva->va_fileid = pctx.nextino++;
-	rva->va_nlink = 101; /* XXX */
+
+	/*
+	 * For root link count, just guess something ridiculously high.
+	 * Guessing too high has no known adverse effects, but fts(3)
+	 * doesn't like too low values.  This guess will be replaced
+	 * with the real value when readdir is first called for
+	 * the root directory.
+	 */
+	rva->va_nlink = 8811;
 
 	if (detach)
 		if (puffs_daemon(pu, 1, 1) == -1)
@@ -344,7 +368,7 @@ static int
 pssh_connect(struct puffs_usermount *pu, int which)
 {
 	struct psshfs_ctx *pctx = puffs_getspecific(pu);
-	char **sshargs = pctx->sshargs;
+	char * const *sshargs = pctx->sshargs;
 	int fds[2];
 	pid_t pid;
 	int dnfd, x;
