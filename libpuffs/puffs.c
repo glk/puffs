@@ -432,12 +432,13 @@ puffs_daemon(struct puffs_usermount *pu, int nochdir, int noclose)
 		close(pu->pu_dpipe[1]);
 		n = read(pu->pu_dpipe[0], &value, sizeof(int));
 		if (n == -1)
-			err(1, "puffs_daemon");
+			err(1, "puffs_daemon (read from pu->pu_dpipe)");
 		if (n != sizeof(value))
-			errx(1, "puffs_daemon got %ld bytes", n);
+			errx(1, "puffs_daemon got %ld bytes instead of %ld", n,
+			    sizeof(value));
 		if (value) {
 			errno = value;
-			err(1, "puffs_daemon");
+			err(1, "puffs_daemon (read value != 0: %d)", value);
 		}
 		exit(0);
 	} else {
