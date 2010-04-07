@@ -1748,7 +1748,8 @@ lowerwrite:
 			}
 		}
 		puffs_msgmem_release(park_write);
-		PUFFS_LOCKVNODE(pn, ltype, error);
+		if (!vplocked)
+			PUFFS_LOCKVNODE(pn, ltype, error);
 	}
 
 	return error;
