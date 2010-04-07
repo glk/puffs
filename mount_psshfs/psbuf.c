@@ -37,17 +37,19 @@ __RCSID("$NetBSD: psbuf.c,v 1.14 2009/05/20 14:08:21 pooka Exp $");
  */
 
 #include <sys/types.h>
+#include <sys/endian.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <sys/vnode.h>
 
 #include <err.h>
 #include <errno.h>
 #include <stdlib.h>
-#include <util.h>
 #include <unistd.h>
 
 #include "psshfs.h"
 #include "sftp_proto.h"
+#include "util_compat.h"
 
 #define FAILRV(x) do { int rv; if ((rv=x)) return (rv); } while (/*CONSTCOND*/0)
 #define READSTATE_LENGTH(off) (off < 4)
@@ -57,6 +59,22 @@ __RCSID("$NetBSD: psbuf.c,v 1.14 2009/05/20 14:08:21 pooka Exp $");
 #define SFTP_REQIDOFF	5
 
 #define CHECK(v) if (!(v)) abort()
+
+#ifndef HTOBE16
+#if BYTE_ORDER == BIG_ENDIAN
+#define HTOBE16(x)		(void) (x)
+#define HTOBE32(x)		(void) (x)
+#define HTOBE64(x)		(void) (x)
+#else /* LITTLE_ENDIAN */
+#define HTOBE16(x)		(x) = htobe16((uint16_t)(x))
+#define HTOBE32(x)		(x) = htobe32((uint32_t)(x))
+#define HTOBE64(x)		(x) = htobe64((uint64_t)(x))
+#endif
+
+#define BE16TOH(x)		HTOBE16(x)
+#define BE32TOH(x)		HTOBE32(x)
+#define BE64TOH(x)		HTOBE64(x)
+#endif
 
 uint8_t
 psbuf_get_type(struct puffs_framebuf *pb)
@@ -265,7 +283,7 @@ psbuf_put_vattr(struct puffs_framebuf *pb, const struct vattr *va)
 		flags |= SSH_FILEXFER_ATTR_SIZE;
 	if (va->va_uid != PUFFS_VNOVAL)
 		flags |= SSH_FILEXFER_ATTR_UIDGID;
-	if (va->va_mode != PUFFS_VNOVAL)
+	if (va->va_mode != (u_short) PUFFS_VNOVAL)
 		flags |= SSH_FILEXFER_ATTR_PERMISSIONS;
 
 	if (va->va_atime.tv_sec != PUFFS_VNOVAL)
@@ -357,6 +375,7 @@ psbuf_get_vattr(struct puffs_framebuf *pb, struct vattr *vap)
 {
 	uint32_t flags;
 	uint32_t val;
+	uint32_t tmpval; 
 
 	puffs_vattr_null(vap);
 
@@ -371,7 +390,8 @@ psbuf_get_vattr(struct puffs_framebuf *pb, struct vattr *vap)
 		FAILRV(psbuf_get_4(pb, &vap->va_gid));
 	}
 	if (flags & SSH_FILEXFER_ATTR_PERMISSIONS) {
-		FAILRV(psbuf_get_4(pb, &vap->va_mode));
+		FAILRV(psbuf_get_4(pb, &tmpval));
+		vap->va_mode = tmpval;
 		vap->va_type = puffs_mode2vt(vap->va_mode);
 	}
 	if (flags & SSH_FILEXFER_ATTR_ACCESSTIME) {

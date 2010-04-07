@@ -36,12 +36,13 @@ __RCSID("$NetBSD: puffs.c,v 1.98 2009/01/08 02:28:08 lukem Exp $");
 
 #include <sys/param.h>
 #include <sys/mount.h>
+#include <sys/filio.h>
+#include <sys/uio.h>
 
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mntopts.h>
 #include <paths.h>
 #include <puffs.h>
 #include <stdio.h>
@@ -56,7 +57,7 @@ __RCSID("$NetBSD: puffs.c,v 1.98 2009/01/08 02:28:08 lukem Exp $");
 const struct mntopt puffsmopts[] = {
 	MOPT_STDOPTS,
 	PUFFSMOPT_STD,
-	MOPT_NULL,
+	MOPT_END,
 };
 
 #ifdef PUFFS_WITH_THREADS
@@ -246,7 +247,7 @@ puffs_getroot(struct puffs_usermount *pu)
 
 void
 puffs_setrootinfo(struct puffs_usermount *pu, enum vtype vt,
-	vsize_t vsize, dev_t rdev)
+	size_t vsize, dev_t rdev)
 {
 	struct puffs_kargs *pargs = pu->pu_kargp;
 
@@ -481,6 +482,7 @@ int
 puffs_mount(struct puffs_usermount *pu, const char *dir, int mntflags,
 	puffs_cookie_t cookie)
 {
+	struct iovec iov[6];
 	char rp[MAXPATHLEN];
 	int rv, fd, sverrno;
 	char *comfd;
@@ -490,7 +492,7 @@ puffs_mount(struct puffs_usermount *pu, const char *dir, int mntflags,
 	/* XXXkludgehere */
 	/* kauth doesn't provide this service any longer */
 	if (geteuid() != 0)
-		mntflags |= MNT_NOSUID | MNT_NODEV;
+		mntflags |= MNT_NOSUID;
 
 	if (realpath(dir, rp) == NULL) {
 		rv = -1;
@@ -564,8 +566,20 @@ do {									\
 			    "what you want?", fd);
 
 		pu->pu_kargp->pa_fd = pu->pu_fd = fd;
-		if ((rv = mount(MOUNT_PUFFS, rp, mntflags,
-		    pu->pu_kargp, sizeof(struct puffs_kargs))) == -1)
+		iov[0].iov_base = strdup("fstype");
+		iov[0].iov_len = sizeof("fstype");
+		iov[1].iov_base = strdup("puffs");
+		iov[1].iov_len = strlen(iov[1].iov_base) + 1;
+		iov[2].iov_base = strdup("fspath");
+		iov[2].iov_len = sizeof("fspath");
+		iov[3].iov_base = rp;
+		iov[3].iov_len = strlen(rp) + 1;
+		iov[4].iov_base = strdup("puffs_args");
+		iov[4].iov_len = sizeof("puffs_args");
+		iov[5].iov_base = pu->pu_kargp;
+		iov[5].iov_len = sizeof(struct puffs_kargs);
+
+		if ((rv = nmount(iov, 6, mntflags)) == -1)
 			goto out;
 	}
 
@@ -782,14 +796,14 @@ puffs__theloop(struct puffs_cc *pcc)
 			if (FIO_EN_WRITE(fio)) {
 				EV_SET(&pu->pu_evs[nchanges], fio->io_fd,
 				    EVFILT_WRITE, EV_ENABLE, 0, 0,
-				    (uintptr_t)fio);
+				    (void*)fio);
 				fio->stat |= FIO_WR;
 				nchanges++;
 			}
 			if (FIO_RM_WRITE(fio)) {
 				EV_SET(&pu->pu_evs[nchanges], fio->io_fd,
 				    EVFILT_WRITE, EV_DISABLE, 0, 0,
-				    (uintptr_t)fio);
+				    (void*)fio);
 				fio->stat &= ~FIO_WR;
 				nchanges++;
 			}
@@ -892,10 +906,10 @@ puffs_mainloop(struct puffs_usermount *pu)
 
 	LIST_FOREACH(fio, &pu->pu_ios, fio_entries) {
 		EV_SET(curev, fio->io_fd, EVFILT_READ, EV_ADD,
-		    0, 0, (uintptr_t)fio);
+		    0, 0, (void*)fio);
 		curev++;
 		EV_SET(curev, fio->io_fd, EVFILT_WRITE, EV_ADD | EV_DISABLE,
-		    0, 0, (uintptr_t)fio);
+		    0, 0, (void*)fio);
 		curev++;
 	}
 	if (kevent(pu->pu_kq, pu->pu_evs, 2*pu->pu_nfds, NULL, 0, NULL) == -1)

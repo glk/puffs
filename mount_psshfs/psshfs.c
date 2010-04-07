@@ -46,17 +46,19 @@ __RCSID("$NetBSD: psshfs.c,v 1.54 2009/05/20 15:04:36 pooka Exp $");
 
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
-#include <mntopts.h>
 #include <paths.h>
 #include <poll.h>
 #include <puffs.h>
 #include <signal.h>
 #include <stdlib.h>
-#include <util.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "psshfs.h"
@@ -111,7 +113,6 @@ main(int argc, char *argv[])
 	struct puffs_node *pn_root;
 	puffs_framev_fdnotify_fn notfn;
 	struct vattr *rva;
-	mntoptparse_t mp;
 	char **sshargs;
 	char *userhost;
 	char *hostpath;
@@ -158,10 +159,7 @@ main(int argc, char *argv[])
 			add_ssharg(&sshargs, &nargs, optarg);
 			break;
 		case 'o':
-			mp = getmntopts(optarg, puffsmopts, &mntflags, &pflags);
-			if (mp == NULL)
-				err(1, "getmntopts");
-			freemntopts(mp);
+			getmntopts(optarg, puffsmopts, &mntflags, &pflags);
 			break;
 		case 'p':
 			notfn = psshfs_notify;

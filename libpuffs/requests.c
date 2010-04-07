@@ -38,7 +38,7 @@ __RCSID("$NetBSD: requests.c,v 1.23 2008/01/29 14:54:08 pooka Exp $");
 #include <sys/queue.h>
 #include <sys/socket.h>
 
-#include <dev/putter/putter.h>
+#include <putter.h>
 
 #include <assert.h>
 #include <errno.h>

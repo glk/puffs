@@ -33,7 +33,6 @@ __RCSID("$NetBSD: subr.c,v 1.24 2008/12/28 22:45:05 christos Exp $");
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/vnode.h>
-#include <sys/dirent.h>
 
 #include <assert.h>
 #include <errno.h>
@@ -44,6 +43,8 @@ __RCSID("$NetBSD: subr.c,v 1.24 2008/12/28 22:45:05 christos Exp $");
 #include <unistd.h>
 
 #include "puffs_priv.h"
+
+#include "puffs_dirent_compat.h"
 
 int
 puffs_gendotdent(struct dirent **dent, ino_t id, int dotdot, size_t *reslen)
@@ -99,13 +100,13 @@ puffs_fsnop_sync(struct puffs_usermount *dontuse1, int dontuse2,
 
 /*ARGSUSED*/
 int
-puffs_fsnop_statvfs(struct puffs_usermount *dontuse1, struct statvfs *sbp)
+puffs_fsnop_statvfs(struct puffs_usermount *dontuse1, struct statfs *sbp)
 {
 
-	sbp->f_bsize = sbp->f_frsize = sbp->f_iosize = 512;
+	sbp->f_bsize = sbp->f_iosize = 512;
 
-	sbp->f_bfree=sbp->f_bavail=sbp->f_bresvd=sbp->f_blocks = (fsblkcnt_t)0;
-	sbp->f_ffree=sbp->f_favail=sbp->f_fresvd=sbp->f_files = (fsfilcnt_t)0;
+	sbp->f_bfree=sbp->f_bavail=sbp->f_blocks = (fsblkcnt_t)0;
+	sbp->f_ffree=sbp->f_files = (fsfilcnt_t)0;
 
 	return 0;
 }
@@ -140,7 +141,7 @@ puffs_genfs_node_reclaim(struct puffs_usermount *pu, puffs_cookie_t opc)
  * NULLs from application code
  */
 void
-puffs_zerostatvfs(struct statvfs *sbp)
+puffs_zerostatvfs(struct statfs *sbp)
 {
 
 	puffs_fsnop_statvfs(NULL, sbp);

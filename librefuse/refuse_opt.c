@@ -37,11 +37,12 @@
 #include <sys/types.h>
 
 #include <err.h>
-#include <fuse.h>
-#include <fuse_opt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "fuse.h"
+#include "fuse_opt.h"
 
 #ifdef FUSE_OPT_DEBUG
 #define DPRINTF(x)	do { printf x; } while ( /* CONSTCOND */ 0)
@@ -63,6 +64,7 @@ struct fuse_opt_option {
 };
 
 static int fuse_opt_popt(struct fuse_opt_option *, const struct fuse_opt *);
+static int fuse_opt_realloc_args(struct fuse_args *args, int nargc);
 
 /* 
  * Public API.
@@ -86,24 +88,8 @@ static int fuse_opt_popt(struct fuse_opt_option *, const struct fuse_opt *);
 int
 fuse_opt_add_arg(struct fuse_args *args, const char *arg)
 {
-	struct fuse_args	*ap;
 
-	if (args->allocated == 0) {
-		ap = fuse_opt_deep_copy_args(args->argc, args->argv);
-		args->argv = ap->argv;
-		args->argc = ap->argc;
-		args->allocated = ap->allocated;
-		(void) free(ap);
-	} else if (args->allocated == args->argc) {
-		void *a;
-		int na = args->allocated + 10;
-
-		if ((a = realloc(args->argv, na * sizeof(*args->argv))) == NULL)
-			return -1;
-
-		args->argv = a;
-		args->allocated = na;
-	}
+	fuse_opt_realloc_args(args, args->argc + 1);
 	DPRINTF(("%s: arguments passed: [arg:%s]\n", __func__, arg));
 	if ((args->argv[args->argc++] = strdup(arg)) == NULL)
 		err(1, "fuse_opt_add_arg");
@@ -134,6 +120,31 @@ fuse_opt_deep_copy_args(int argc, char **argv)
 	return ap;
 }
 
+static int
+fuse_opt_realloc_args(struct fuse_args *args, int nargc)
+{
+	struct fuse_args	*ap;
+
+	if (args->allocated == 0) {
+		ap = fuse_opt_deep_copy_args(args->argc, args->argv);
+		args->argv = ap->argv;
+		args->argc = ap->argc;
+		args->allocated = ap->allocated;
+		(void) free(ap);
+	} else if (args->allocated < nargc) {
+		void *a;
+		int na = nargc + 10;
+
+		if ((a = realloc(args->argv, na * sizeof(*args->argv))) == NULL)
+			return -1;
+
+		args->argv = a;
+		args->allocated = na;
+	}
+
+	return 0;
+}
+
 void
 fuse_opt_free_args(struct fuse_args *ap)
 {
@@ -152,24 +163,10 @@ int
 fuse_opt_insert_arg(struct fuse_args *args, int pos, const char *arg)
 {
 	int	i;
-	int	na;
-	void   *a;
 
 	DPRINTF(("%s: arguments passed: [pos=%d] [arg=%s]\n",
 	    __func__, pos, arg));
-	if (args->argv == NULL) {
-		na = 10;
-		a = malloc(na * sizeof(*args->argv));
-	} else {
-		na = args->allocated + 10;
-		a = realloc(args->argv, na * sizeof(*args->argv));
-	}
-	if (a == NULL) {
-		warn("fuse_opt_insert_arg");
-		return -1;
-	}
-	args->argv = a;
-	args->allocated = na;
+	fuse_opt_realloc_args(args, args->argc + 1);
 
 	for (i = args->argc++; i > pos; --i) {
 		args->argv[i] = args->argv[i - 1];

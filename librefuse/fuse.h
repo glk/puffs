@@ -188,6 +188,6 @@ struct fuse *fuse_setup26(int, char **, const struct fuse_operations *,
 }
 #endif
 
-#include <fuse_opt.h>
+#include "fuse_opt.h"
 
 #endif

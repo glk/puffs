@@ -792,7 +792,7 @@ dispatch(struct puffs_cc *pcc)
 		{
 			struct puffs_vnmsg_pathconf *auxt = auxbuf;
 			if (pops->puffs_node_pathconf == NULL) {
-				error = 0;
+				error = EINVAL;
 				break;
 			}
 

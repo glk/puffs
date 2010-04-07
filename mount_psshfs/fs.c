@@ -173,14 +173,14 @@ psshfs_handshake(struct puffs_usermount *pu, int fd)
 }
 
 int
-psshfs_fs_statvfs(struct puffs_usermount *pu, struct statvfs *sbp)
+psshfs_fs_statvfs(struct puffs_usermount *pu, struct statfs *sbp)
 {
 	PSSHFSAUTOVAR(pu);
 	uint64_t tmpval;
 	uint8_t type;
 
 	memset(sbp, 0, sizeof(*sbp));
-	sbp->f_bsize = sbp->f_frsize = sbp->f_iosize = 512;
+	sbp->f_bsize = sbp->f_iosize = 512;
 
 	if ((pctx->extensions & SFTP_EXT_STATVFS) == 0)
 		goto out;
@@ -196,15 +196,15 @@ psshfs_fs_statvfs(struct puffs_usermount *pu, struct statvfs *sbp)
 	}
 
 	psbuf_get_8(pb, &tmpval);
-	sbp->f_bsize = tmpval;
+	sbp->f_iosize = tmpval; /* statvfs.f_bsize */
 	psbuf_get_8(pb, &tmpval);
-	sbp->f_frsize = tmpval;
+	sbp->f_bsize = tmpval; /* statvfs.f_frsize */
 	psbuf_get_8(pb, &sbp->f_blocks);
 	psbuf_get_8(pb, &sbp->f_bfree);
 	psbuf_get_8(pb, &sbp->f_bavail);
 	psbuf_get_8(pb, &sbp->f_files);
 	psbuf_get_8(pb, &sbp->f_ffree);
-	psbuf_get_8(pb, &sbp->f_favail);
+	psbuf_get_8(pb, &tmpval); /* favail */
 
 	psbuf_get_8(pb, &tmpval); /* fsid */
 	psbuf_get_8(pb, &tmpval); /* flag */

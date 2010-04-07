@@ -41,9 +41,11 @@ __RCSID("$NetBSD: opdump.c,v 1.27 2009/04/06 20:47:17 pooka Exp $");
 #include <sys/types.h>
 #include <sys/time.h>
 
+#include <inttypes.h>
 #include <puffs.h>
 #include <puffsdump.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "puffs_priv.h"
 
@@ -256,6 +258,8 @@ static const char *cn_opnames[] = {
 void
 puffsdump_cn(struct puffs_kcn *pkcn)
 {
+	/* XXX_TS under if _KERNEL */
+	const int NAMEI_OPMASK = 3;
 
 	printf("\t\tpuffs_cn: \"%s\", len %zu op %s (flags 0x%x)\n",
 	    pkcn->pkcn_name, pkcn->pkcn_namelen,

@@ -39,12 +39,12 @@
 #include <sys/vnode.h>
 #include <sys/ucred.h>
 #include <sys/statvfs.h>
+#include <sys/mount.h>
 #include <sys/dirent.h>
 #include <sys/fcntl.h>
+#include <vm/vm.h>
 
-#include <dev/putter/putter.h>
-
-#include <uvm/uvm_prot.h>
+#include <putter.h>
 
 #define PUFFSOP_VFS		0x01	/* kernel-> */
 #define PUFFSOP_VN		0x02	/* kernel-> */
@@ -107,10 +107,10 @@ enum {
 
 #define PUFFS_TYPEPREFIX "puffs|"
 
-#define PUFFS_TYPELEN (_VFS_NAMELEN - (sizeof(PUFFS_TYPEPREFIX)+1))
-#define PUFFS_NAMELEN (_VFS_MNAMELEN-1)
+#define PUFFS_TYPELEN (MFSNAMELEN - (sizeof(PUFFS_TYPEPREFIX)+1))
+#define PUFFS_NAMELEN (MNAMELEN-1)
 
-/* 
+/*
  * Just a weak typedef for code clarity.  Additionally, we have a
  * more appropriate vanity type for puffs:
  * <uep> it should be croissant, not cookie.
@@ -132,13 +132,13 @@ struct puffs_kargs {
 
 	puffs_cookie_t	pa_root_cookie;
 	enum vtype	pa_root_vtype;
-	voff_t		pa_root_vsize;
+	off_t		pa_root_vsize;
 	dev_t		pa_root_rdev;
 
-	struct statvfs	pa_svfsb;
+	struct statfs	pa_svfsb;
 
-	char		pa_typename[_VFS_NAMELEN];
-	char		pa_mntfromname[_VFS_MNAMELEN];
+	char		pa_typename[MFSNAMELEN];
+	char		pa_mntfromname[MNAMELEN];
 
 	uint8_t		pa_vnopmask[PUFFS_VN_MAX];
 };
@@ -194,7 +194,7 @@ struct puffs_req {
 /*
  * Flush operation.  This can be used to invalidate:
  * 1) name cache for one node
- * 2) name cache for all children 
+ * 2) name cache for all children
  * 3) name cache for the entire mount
  * 4) page cache for a set of ranges in one node
  * 5) page cache for one entire node
@@ -230,7 +230,7 @@ struct puffs_flush {
  * if it makes a difference between these two and the super-user.
  */
 struct puffs_kcred {
-	struct uucred	pkcr_uuc;
+	struct xucred	pkcr_uuc;
 	uint8_t		pkcr_type;
 	uint8_t		pkcr_internal;
 };
@@ -283,7 +283,7 @@ struct puffs_vfsmsg_unmount {
 struct puffs_vfsmsg_statvfs {
 	struct puffs_req	pvfsr_pr;
 
-	struct statvfs		pvfsr_sb;
+	struct statfs		pvfsr_sb;
 };
 
 struct puffs_vfsmsg_sync {
@@ -298,7 +298,7 @@ struct puffs_vfsmsg_fhtonode {
 
 	void			*pvfsr_fhcookie;	/* IN	*/
 	enum vtype		pvfsr_vtype;		/* IN	*/
-	voff_t			pvfsr_size;		/* IN	*/
+	off_t			pvfsr_size;		/* IN	*/
 	dev_t			pvfsr_rdev;		/* IN	*/
 
 	size_t			pvfsr_dsize;		/* OUT */
@@ -338,7 +338,7 @@ struct puffs_vnmsg_lookup {
 
 	puffs_cookie_t		pvnr_newnode;		/* IN	*/
 	enum vtype		pvnr_vtype;		/* IN	*/
-	voff_t			pvnr_size;		/* IN	*/
+	off_t			pvnr_size;		/* IN	*/
 	dev_t			pvnr_rdev;		/* IN	*/
 };
 
@@ -578,7 +578,7 @@ struct puffs_cacheinfo {
 	struct puffs_req	pcache_pr;
 
 	int			pcache_type;
-	size_t			pcache_nruns;		
+	size_t			pcache_nruns;
 	struct puffs_cacherun	pcache_runs[0];
 };
 #define PCACHE_TYPE_READ	0

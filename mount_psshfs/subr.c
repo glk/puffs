@@ -35,10 +35,11 @@ __RCSID("$NetBSD: subr.c,v 1.46 2009/05/20 13:56:36 pooka Exp $");
 #include <errno.h>
 #include <puffs.h>
 #include <stdlib.h>
-#include <util.h>
+#include <stdio.h>
 
 #include "psshfs.h"
 #include "sftp_proto.h"
+#include "util_compat.h"
 
 static void
 freedircache(struct psshfs_dir *base, size_t count)

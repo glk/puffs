@@ -30,44 +30,56 @@
  */
 
 #include <sys/cdefs.h>
+/*
 __KERNEL_RCSID(0, "$NetBSD: puffs_node.c,v 1.13 2008/05/06 12:33:16 ad Exp $");
+*/
 
 #include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
 #include <sys/hash.h>
-#include <sys/kmem.h>
 #include <sys/malloc.h>
 #include <sys/mount.h>
 #include <sys/namei.h>
 #include <sys/vnode.h>
 
-#include <fs/puffs/puffs_msgif.h>
-#include <fs/puffs/puffs_sys.h>
+#include <vm/uma.h>
+#include <vm/vm.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
+#include <vm/vm_extern.h>
 
-#include <miscfs/genfs/genfs_node.h>
-#include <miscfs/specfs/specdev.h>
-
-static const struct genfs_ops puffs_genfsops = {
-	.gop_size = puffs_gop_size,
-	.gop_write = genfs_gop_write,
-	.gop_markupdate = puffs_gop_markupdate,
-#if 0
-	.gop_alloc, should ask userspace
-#endif
-};
+#include <puffs_msgif.h>
+#include <puffs_sys.h>
 
 static __inline struct puffs_node_hashlist
 	*puffs_cookie2hashlist(struct puffs_mount *, puffs_cookie_t);
 static struct puffs_node *puffs_cookie2pnode(struct puffs_mount *,
 					     puffs_cookie_t);
 
-struct pool puffs_pnpool;
+uma_zone_t puffs_pnpool;
+
+
+/*
+ * Flush VM pages associtaed with vnode
+ */
+void
+puffs_flushvnode(struct vnode *vp)
+{
+	if (vp->v_object) {
+		VM_OBJECT_LOCK(vp->v_object);
+		vm_object_page_clean(vp->v_object, 0, 0, OBJPC_SYNC);
+		VM_OBJECT_UNLOCK(vp->v_object);
+	}
+}
 
 /*
  * Grab a vnode, intialize all the puffs-dependant stuff.
  */
 int
 puffs_getvnode(struct mount *mp, puffs_cookie_t ck, enum vtype type,
-	voff_t vsize, dev_t rdev, struct vnode **vpp)
+	off_t vsize, dev_t rdev, int lkflag, struct vnode **vpp)
 {
 	struct puffs_mount *pmp;
 	struct puffs_newcookie *pnc;
@@ -75,6 +87,8 @@ puffs_getvnode(struct mount *mp, puffs_cookie_t ck, enum vtype type,
 	struct puffs_node *pnode;
 	struct puffs_node_hashlist *plist;
 	int error;
+
+	KASSERT(mp != NULL, ("mp == NULL"));
 
 	pmp = MPTOPUFFSMP(mp);
 
@@ -84,105 +98,96 @@ puffs_getvnode(struct mount *mp, puffs_cookie_t ck, enum vtype type,
 		    "bad node type", ck);
 		goto bad;
 	}
-	if (vsize == VSIZENOTSET) {
+	if (vsize == VNOVAL) {
 		puffs_senderr(pmp, PUFFS_ERR_MAKENODE, EINVAL,
 		    "VSIZENOTSET is not a valid size", ck);
 		goto bad;
 	}
 
-	error = getnewvnode(VT_PUFFS, mp, puffs_vnodeop_p, &vp);
-	if (error)
+	pnode = uma_zalloc(puffs_pnpool, M_WAITOK | M_ZERO);
+
+	error = getnewvnode("puffs", mp, &puffs_vnodeops, &vp);
+	if (error) {
+		uma_zfree(puffs_pnpool, pnode);
 		goto bad;
-	vp->v_vnlock = NULL;
-	vp->v_type = type;
+	}
+	vn_lock(vp, lkflag | LK_RETRY);
+	error = insmntque(vp, mp);
+	if (error) {
+		vp = NULL;
+		uma_zfree(puffs_pnpool, pnode);
+		goto bad;
+	}
 
 	/*
 	 * Creation should not fail after this point.  Or if it does,
 	 * care must be taken so that VOP_INACTIVE() isn't called.
 	 */
 
-	/* default size */
-	uvm_vnp_setsize(vp, 0);
-
-	/* dances based on vnode type. almost ufs_vinit(), but not quite */
 	switch (type) {
 	case VCHR:
 	case VBLK:
-		/*
-		 * replace vnode operation vector with the specops vector.
-		 * our user server has very little control over the node
-		 * if it decides its a character or block special file
-		 */
-		vp->v_op = puffs_specop_p;
-		spec_node_init(vp, rdev);
-		break;
-
-	case VFIFO:
-		vp->v_op = puffs_fifoop_p;
-		break;
-
-	case VREG:
-		uvm_vnp_setsize(vp, vsize);
-		break;
-
 	case VDIR:
 	case VLNK:
 	case VSOCK:
+		break;
+	case VFIFO:
+		vp->v_op = &puffs_fifoops;
+		break;
+	case VREG:
+		vnode_pager_setsize(vp, vsize);
 		break;
 	default:
 		panic("puffs_getvnode: invalid vtype %d", type);
 	}
 
-	pnode = pool_get(&puffs_pnpool, PR_WAITOK);
-	memset(pnode, 0, sizeof(struct puffs_node));
-
 	pnode->pn_cookie = ck;
 	pnode->pn_refcount = 1;
 
 	/* insert cookie on list, take off of interlock list */
-	mutex_init(&pnode->pn_mtx, MUTEX_DEFAULT, IPL_NONE);
-	selinit(&pnode->pn_sel);
+	mtx_init(&pnode->pn_mtx, "puffs pn_mtx", NULL, MTX_DEF);
+	knlist_init(&pnode->pn_sel.si_note, NULL, NULL, NULL, NULL, NULL);
 	plist = puffs_cookie2hashlist(pmp, ck);
-	mutex_enter(&pmp->pmp_lock);
+	mtx_lock(&pmp->pmp_lock);
 	LIST_INSERT_HEAD(plist, pnode, pn_hashent);
 	if (ck != pmp->pmp_root_cookie) {
 		LIST_FOREACH(pnc, &pmp->pmp_newcookie, pnc_entries) {
 			if (pnc->pnc_cookie == ck) {
 				LIST_REMOVE(pnc, pnc_entries);
-				kmem_free(pnc, sizeof(struct puffs_newcookie));
+				free(pnc, M_PUFFS);
 				break;
 			}
 		}
-		KASSERT(pnc != NULL);
+		KASSERT(pnc != NULL, ("pnc != NULL"));
 	}
-	mutex_exit(&pmp->pmp_lock);
+	mtx_unlock(&pmp->pmp_lock);
 
 	vp->v_data = pnode;
 	vp->v_type = type;
 	pnode->pn_vp = vp;
 	pnode->pn_serversize = vsize;
 
-	genfs_node_init(vp, &puffs_genfsops);
 	*vpp = vp;
 
 	DPRINTF(("new vnode at %p, pnode %p, cookie %p\n", vp,
 	    pnode, pnode->pn_cookie));
+	ASSERT_VI_UNLOCKED(vp, "puffs_getvnode");
 
 	return 0;
 
  bad:
 	/* remove staging cookie from list */
 	if (ck != pmp->pmp_root_cookie) {
-		mutex_enter(&pmp->pmp_lock);
+		mtx_lock(&pmp->pmp_lock);
 		LIST_FOREACH(pnc, &pmp->pmp_newcookie, pnc_entries) {
 			if (pnc->pnc_cookie == ck) {
 				LIST_REMOVE(pnc, pnc_entries);
-				kmem_free(pnc, sizeof(struct puffs_newcookie));
+				free(pnc, M_PUFFS);
 				break;
 			}
 		}
-		KASSERT(pnc != NULL);
-		mutex_exit(&pmp->pmp_lock);
+		KASSERT(pnc != NULL, ("pnc != NULL"));
+		mtx_unlock(&pmp->pmp_lock);
 	}
 
 	return error;
@@ -194,10 +199,13 @@ puffs_newnode(struct mount *mp, struct vnode *dvp, struct vnode **vpp,
 	puffs_cookie_t ck, struct componentname *cnp,
 	enum vtype type, dev_t rdev)
 {
-	struct puffs_mount *pmp = MPTOPUFFSMP(mp);
-	struct puffs_newcookie *pnc;
+	struct puffs_mount *pmp;
+	struct puffs_newcookie *pnc, *npnc;
 	struct vnode *vp;
 	int error;
+
+	KASSERT(mp != NULL, ("mp == NULL"));
+	pmp = MPTOPUFFSMP(mp);
 
 	/* userspace probably has this as a NULL op */
 	if (ck == NULL) {
@@ -210,34 +218,37 @@ puffs_newnode(struct mount *mp, struct vnode *dvp, struct vnode **vpp,
 	 * Explicitly check the root node cookie, since it might be
 	 * reclaimed from the kernel when this check is made.
 	 */
-	mutex_enter(&pmp->pmp_lock);
+	mtx_lock(&pmp->pmp_lock);
 	if (ck == pmp->pmp_root_cookie
 	    || puffs_cookie2pnode(pmp, ck) != NULL) {
-		mutex_exit(&pmp->pmp_lock);
+		mtx_unlock(&pmp->pmp_lock);
 		puffs_senderr(pmp, PUFFS_ERR_MAKENODE, EEXIST,
 		    "cookie exists", ck);
 		return EPROTO;
 	}
+	mtx_unlock(&pmp->pmp_lock);
 
+	npnc = malloc(sizeof(struct puffs_newcookie), M_PUFFS, M_WAITOK);
+	npnc->pnc_cookie = ck;
+
+	mtx_lock(&pmp->pmp_lock);
 	LIST_FOREACH(pnc, &pmp->pmp_newcookie, pnc_entries) {
 		if (pnc->pnc_cookie == ck) {
-			mutex_exit(&pmp->pmp_lock);
+			mtx_unlock(&pmp->pmp_lock);
+			free(npnc, M_PUFFS);
 			puffs_senderr(pmp, PUFFS_ERR_MAKENODE, EEXIST,
 			    "cookie exists", ck);
 			return EPROTO;
 		}
 	}
-	pnc = kmem_alloc(sizeof(struct puffs_newcookie), KM_SLEEP);
-	pnc->pnc_cookie = ck;
-	LIST_INSERT_HEAD(&pmp->pmp_newcookie, pnc, pnc_entries);
-	mutex_exit(&pmp->pmp_lock);
+	LIST_INSERT_HEAD(&pmp->pmp_newcookie, npnc, pnc_entries);
+	mtx_unlock(&pmp->pmp_lock);
 
-	error = puffs_getvnode(dvp->v_mount, ck, type, 0, rdev, &vp);
+	error = puffs_getvnode(dvp->v_mount, ck, type, 0, rdev, LK_EXCLUSIVE, &vp);
 	if (error)
 		return error;
 
 	vp->v_type = type;
-	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	*vpp = vp;
 
 	if ((cnp->cn_flags & MAKEENTRY) && PUFFS_USE_NAMECACHE(pmp))
@@ -249,19 +260,12 @@ puffs_newnode(struct mount *mp, struct vnode *dvp, struct vnode **vpp,
 void
 puffs_putvnode(struct vnode *vp)
 {
-	struct puffs_mount *pmp;
 	struct puffs_node *pnode;
 
-	pmp = VPTOPUFFSMP(vp);
 	pnode = VPTOPP(vp);
 
-#ifdef DIAGNOSTIC
-	if (vp->v_tag != VT_PUFFS)
-		panic("puffs_putvnode: %p not a puffs vnode", vp);
-#endif
-
 	LIST_REMOVE(pnode, pn_hashent);
-	genfs_node_destroy(vp);
+	vnode_destroy_vobject(vp);
 	puffs_releasenode(pnode);
 	vp->v_data = NULL;
 
@@ -273,7 +277,7 @@ puffs_cookie2hashlist(struct puffs_mount *pmp, puffs_cookie_t ck)
 {
 	uint32_t hash;
 
-	hash = hash32_buf(&ck, sizeof(void *), HASH32_BUF_INIT);
+	hash = hash32_buf(&ck, sizeof(void *), HASHINIT);
 	return &pmp->pmp_pnodehash[hash % pmp->pmp_npnodehash];
 }
 
@@ -300,7 +304,7 @@ puffs_cookie2pnode(struct puffs_mount *pmp, puffs_cookie_t ck)
  * Make sure root vnode exists and reference it.  Does NOT lock.
  */
 static int
-puffs_makeroot(struct puffs_mount *pmp)
+puffs_makeroot(struct puffs_mount *pmp, int lkflag)
 {
 	struct vnode *vp;
 	int rv;
@@ -312,39 +316,45 @@ puffs_makeroot(struct puffs_mount *pmp)
 	 * pmp_root is set here and cleared in puffs_reclaim().
 	 */
  retry:
-	mutex_enter(&pmp->pmp_lock);
+	mtx_lock(&pmp->pmp_lock);
 	vp = pmp->pmp_root;
 	if (vp) {
-		mutex_enter(&vp->v_interlock);
-		mutex_exit(&pmp->pmp_lock);
-		if (vget(vp, LK_INTERLOCK) == 0)
-			return 0;
-	} else
-		mutex_exit(&pmp->pmp_lock);
+		VI_LOCK(vp);
+		mtx_unlock(&pmp->pmp_lock);
+		vholdl(vp);
+		vget(vp, lkflag | LK_INTERLOCK | LK_RETRY, curthread);
+		vdrop(vp);
+		ASSERT_VI_UNLOCKED(vp, "puffs_makeroot");
+
+		return 0;
+	} else {
+		mtx_unlock(&pmp->pmp_lock);
+	}
 
 	/*
 	 * So, didn't have the magic root vnode available.
 	 * No matter, grab another and stuff it with the cookie.
 	 */
 	if ((rv = puffs_getvnode(pmp->pmp_mp, pmp->pmp_root_cookie,
-	    pmp->pmp_root_vtype, pmp->pmp_root_vsize, pmp->pmp_root_rdev, &vp)))
+	    pmp->pmp_root_vtype, pmp->pmp_root_vsize, pmp->pmp_root_rdev, lkflag, &vp)))
 		return rv;
 
 	/*
 	 * Someone magically managed to race us into puffs_getvnode?
 	 * Put our previous new vnode back and retry.
 	 */
-	mutex_enter(&pmp->pmp_lock);
+	mtx_lock(&pmp->pmp_lock);
 	if (pmp->pmp_root) {
-		mutex_exit(&pmp->pmp_lock);
+		mtx_unlock(&pmp->pmp_lock);
 		puffs_putvnode(vp);
 		goto retry;
-	} 
+	}
 
 	/* store cache */
 	vp->v_vflag |= VV_ROOT;
 	pmp->pmp_root = vp;
-	mutex_exit(&pmp->pmp_lock);
+	mtx_unlock(&pmp->pmp_lock);
+	ASSERT_VI_UNLOCKED(vp, "puffs_makeroot");
 
 	return 0;
 }
@@ -358,56 +368,51 @@ puffs_makeroot(struct puffs_mount *pmp)
  * vnode lock, e.g. file server issued putpages.
  */
 int
-puffs_cookie2vnode(struct puffs_mount *pmp, puffs_cookie_t ck, int lock,
+puffs_cookie2vnode(struct puffs_mount *pmp, puffs_cookie_t ck, int lkflag,
 	int willcreate, struct vnode **vpp)
 {
 	struct puffs_node *pnode;
 	struct puffs_newcookie *pnc;
 	struct vnode *vp;
-	int vgetflags, rv;
+	int rv;
 
 	/*
 	 * Handle root in a special manner, since we want to make sure
 	 * pmp_root is properly set.
 	 */
 	if (ck == pmp->pmp_root_cookie) {
-		if ((rv = puffs_makeroot(pmp)))
+		if ((rv = puffs_makeroot(pmp, lkflag)))
 			return rv;
-		if (lock)
-			vn_lock(pmp->pmp_root, LK_EXCLUSIVE | LK_RETRY);
-
 		*vpp = pmp->pmp_root;
 		return 0;
 	}
 
-	mutex_enter(&pmp->pmp_lock);
+	mtx_lock(&pmp->pmp_lock);
 	pnode = puffs_cookie2pnode(pmp, ck);
 	if (pnode == NULL) {
+		mtx_unlock(&pmp->pmp_lock);
 		if (willcreate) {
-			pnc = kmem_alloc(sizeof(struct puffs_newcookie),
-			    KM_SLEEP);
+			pnc = malloc(sizeof(struct puffs_newcookie),
+			    M_PUFFS, M_WAITOK);
 			pnc->pnc_cookie = ck;
+			mtx_lock(&pmp->pmp_lock);
 			LIST_INSERT_HEAD(&pmp->pmp_newcookie, pnc, pnc_entries);
+			mtx_unlock(&pmp->pmp_lock);
 		}
-		mutex_exit(&pmp->pmp_lock);
 		return PUFFS_NOSUCHCOOKIE;
 	}
 	vp = pnode->pn_vp;
-	mutex_enter(&vp->v_interlock);
-	mutex_exit(&pmp->pmp_lock);
+	VI_LOCK(vp);
+	mtx_unlock(&pmp->pmp_lock);
 
-	vgetflags = LK_INTERLOCK;
-	if (lock)
-		vgetflags |= LK_EXCLUSIVE | LK_RETRY;
-	if ((rv = vget(vp, vgetflags)))
-		return rv;
+	vget(vp, lkflag | LK_INTERLOCK | LK_RETRY, curthread);
 
 	*vpp = vp;
 	return 0;
 }
 
 void
-puffs_updatenode(struct puffs_node *pn, int flags, voff_t size)
+puffs_updatenode(struct puffs_node *pn, int flags, off_t size)
 {
 	struct timespec ts;
 
@@ -416,6 +421,7 @@ puffs_updatenode(struct puffs_node *pn, int flags, voff_t size)
 
 	nanotime(&ts);
 
+	mtx_lock(&pn->pn_mtx);
 	if (flags & PUFFS_UPDATEATIME) {
 		pn->pn_mc_atime = ts;
 		pn->pn_stat |= PNODE_METACACHE_ATIME;
@@ -432,6 +438,7 @@ puffs_updatenode(struct puffs_node *pn, int flags, voff_t size)
 		pn->pn_mc_size = size;
 		pn->pn_stat |= PNODE_METACACHE_SIZE;
 	}
+	mtx_unlock(&pn->pn_mtx);
 }
 
 /*
@@ -442,7 +449,7 @@ void
 puffs_referencenode(struct puffs_node *pn)
 {
 
-	KASSERT(mutex_owned(&pn->pn_mtx));
+	mtx_assert(&pn->pn_mtx, MA_OWNED);
 	pn->pn_refcount++;
 }
 
@@ -457,13 +464,58 @@ void
 puffs_releasenode(struct puffs_node *pn)
 {
 
-	mutex_enter(&pn->pn_mtx);
+	mtx_lock(&pn->pn_mtx);
 	if (--pn->pn_refcount == 0) {
-		mutex_exit(&pn->pn_mtx);
-		mutex_destroy(&pn->pn_mtx);
-		seldestroy(&pn->pn_sel);
-		pool_put(&puffs_pnpool, pn);
+		DPRINTF(("puffs_releasenode: destroy puffs_node pn_vp=%p\n", pn->pn_vp));
+		mtx_unlock(&pn->pn_mtx);
+		mtx_destroy(&pn->pn_mtx);
+		knlist_destroy(&pn->pn_sel.si_note);
+		uma_zfree(puffs_pnpool, pn);
 	} else {
-		mutex_exit(&pn->pn_mtx);
+		mtx_unlock(&pn->pn_mtx);
 	}
 }
+
+int
+puffs_lockvnode(struct puffs_node *pn, int ltype)
+{
+	struct vnode *vp;
+
+	KASSERT(pn != NULL, ("invalid node"));
+	vp = pn->pn_vp;
+	KASSERT(vp != NULL, ("invalid vnode"));
+	ASSERT_VOP_UNLOCKED(vp, "puffs_lockvnode");
+
+	vrele(vp);
+	vn_lock(vp, (ltype & LK_TYPE_MASK) | LK_RETRY);
+	ASSERT_VOP_LOCKED(vp, "puffs_lockvnode");
+	puffs_releasenode(pn);
+	if (vp->v_iflag & VI_DOOMED) {
+		DPRINTF(("puffs_lockvnode: vnode is dead %p\n", vp));
+		return EBADF;
+	}
+	return 0;
+}
+
+int
+puffs_unlockvnode(struct puffs_node *pn, int *ltype)
+{
+	struct vnode *vp;
+	int error;
+
+	KASSERT(pn != NULL, ("invalid node"));
+	vp = pn->pn_vp;
+	KASSERT(vp != NULL, ("invalid vnode"));
+	ASSERT_VOP_LOCKED(vp, "puffs_unlockvnode");
+
+	mtx_lock(&pn->pn_mtx);
+	puffs_referencenode(pn);
+	mtx_unlock(&pn->pn_mtx);
+	vref(vp);
+	if (ltype)
+		*ltype = VOP_ISLOCKED(vp);
+	error = VOP_UNLOCK(vp, 0);
+	ASSERT_VOP_UNLOCKED(vp, "puffs_unlockvnode");
+	return error;
+}
+

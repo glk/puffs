@@ -53,7 +53,6 @@ main(int argc, char *argv[])
 	struct puffs_pathobj *po_root;
 	struct puffs_node *pn_root;
 	struct stat sb;
-	mntoptparse_t mp;
 	int mntflags, pflags;
 	int ch;
 	int detach;
@@ -68,10 +67,7 @@ main(int argc, char *argv[])
 	while ((ch = getopt(argc, argv, "o:s")) != -1) {
 		switch (ch) {
 		case 'o':
-			mp = getmntopts(optarg, puffsmopts, &mntflags, &pflags);
-			if (mp == NULL)
-				err(1, "getmntopts");
-			freemntopts(mp);
+			getmntopts(optarg, puffsmopts, &mntflags, &pflags);
 			break;
 		case 's':
 			detach = 0;

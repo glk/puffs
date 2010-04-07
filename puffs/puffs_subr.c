@@ -29,21 +29,30 @@
  */
 
 #include <sys/cdefs.h>
+/*
 __KERNEL_RCSID(0, "$NetBSD: puffs_subr.c,v 1.66 2008/11/16 19:34:30 pooka Exp $");
+*/
 
 #include <sys/param.h>
-#include <sys/buf.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/mount.h>
 #include <sys/namei.h>
+#include <sys/bio.h>
+#include <sys/buf.h>
 #include <sys/poll.h>
 #include <sys/proc.h>
+#include <sys/libkern.h>
 
-#include <fs/puffs/puffs_msgif.h>
-#include <fs/puffs/puffs_sys.h>
+#include <puffs_msgif.h>
+#include <puffs_sys.h>
+
+MALLOC_DEFINE(M_PUFFS, "puffs", "PUFFS");
 
 #ifdef PUFFSDEBUG
-int puffsdebug;
+int puffsdebug = 2;
 #endif
 
 void
@@ -70,7 +79,7 @@ puffs_makecn(struct puffs_kcn *pkcn, struct puffs_kcred *pkcr,
  * Convert given credentials to struct puffs_kcred for userspace.
  */
 void
-puffs_credcvt(struct puffs_kcred *pkcr, const kauth_cred_t cred)
+puffs_credcvt(struct puffs_kcred *pkcr, struct ucred *cred)
 {
 
 	memset(pkcr, 0, sizeof(struct puffs_kcred));
@@ -83,7 +92,7 @@ puffs_credcvt(struct puffs_kcred *pkcr, const kauth_cred_t cred)
 			pkcr->pkcr_internal = PUFFCRED_CRED_FSCRED;
  	} else {
 		pkcr->pkcr_type = PUFFCRED_TYPE_UUC;
-		kauth_cred_to_uucred(&pkcr->pkcr_uuc, cred);
+		cru2x(cred, &pkcr->pkcr_uuc);
 	}
 }
 
@@ -111,7 +120,7 @@ puffs_parkdone_asyncbioread(struct puffs_mount *pmp,
 		}
 	}
 
-	biodone(bp);
+	bdone(bp);
 }
 
 void
@@ -134,7 +143,7 @@ puffs_parkdone_asyncbiowrite(struct puffs_mount *pmp,
 		}
 	}
 
-	biodone(bp);
+	bdone(bp);
 }
 
 /* XXX: userspace can leak kernel resources */
@@ -151,11 +160,11 @@ puffs_parkdone_poll(struct puffs_mount *pmp, struct puffs_req *preq, void *arg)
 	else
 		revents = POLLERR;
 
-	mutex_enter(&pn->pn_mtx);
+	mtx_lock(&pn->pn_mtx);
 	pn->pn_revents |= revents;
-	mutex_exit(&pn->pn_mtx);
+	mtx_unlock(&pn->pn_mtx);
 
-	selnotify(&pn->pn_sel, revents, 0);
+	selwakeup(&pn->pn_sel);
 
 	puffs_releasenode(pn);
 }
@@ -164,7 +173,7 @@ void
 puffs_mp_reference(struct puffs_mount *pmp)
 {
 
-	KASSERT(mutex_owned(&pmp->pmp_lock));
+	mtx_assert(&pmp->pmp_lock, MA_OWNED);
 	pmp->pmp_refcount++;
 }
 
@@ -172,30 +181,9 @@ void
 puffs_mp_release(struct puffs_mount *pmp)
 {
 
-	KASSERT(mutex_owned(&pmp->pmp_lock));
+	mtx_assert(&pmp->pmp_lock, MA_OWNED);
 	if (--pmp->pmp_refcount == 0)
 		cv_broadcast(&pmp->pmp_refcount_cv);
-}
-
-void
-puffs_gop_size(struct vnode *vp, off_t size, off_t *eobp,
-	int flags)
-{
-
-	*eobp = size;
-}
-
-void
-puffs_gop_markupdate(struct vnode *vp, int flags)
-{
-	int uflags = 0;
-
-	if (flags & GOP_UPDATE_ACCESSED)
-		uflags |= PUFFS_UPDATEATIME;
-	if (flags & GOP_UPDATE_MODIFIED)
-		uflags |= PUFFS_UPDATEMTIME;
-
-	puffs_updatenode(VPTOPP(vp), uflags, 0);
 }
 
 void

@@ -47,6 +47,8 @@ __RCSID("$NetBSD: null.c,v 1.27 2009/01/08 02:19:48 lukem Exp $");
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "puffs_dirent_compat.h"
+
 PUFFSOP_PROTOS(puffs_null)
 
 /*
@@ -62,7 +64,7 @@ processvattr(const char *path, const struct vattr *va, int regular)
 		if (lchown(path, va->va_uid, va->va_gid) == -1)
 			return errno;
 
-	if (va->va_mode != (unsigned)PUFFS_VNOVAL)
+	if (va->va_mode != (u_short)PUFFS_VNOVAL)
 		if (lchmod(path, va->va_mode) == -1)
 			return errno;
 
@@ -189,10 +191,10 @@ puffs_null_setops(struct puffs_ops *pops)
 
 /*ARGSUSED*/
 int
-puffs_null_fs_statvfs(struct puffs_usermount *pu, struct statvfs *svfsb)
+puffs_null_fs_statvfs(struct puffs_usermount *pu, struct statfs *svfsb)
 {
 
-	if (statvfs(PNPATH(puffs_getroot(pu)), svfsb) == -1)
+	if (statfs(PNPATH(puffs_getroot(pu)), svfsb) == -1)
 		return errno;
 
 	return 0;
@@ -204,19 +206,15 @@ puffs_null_fs_statvfs(struct puffs_usermount *pu, struct statvfs *svfsb)
  * the fid type.  Just adjust it a bit and stop whining.
  *
  * Yes, this really really needs fixing.  Yes, *REALLY*.
+ *
+ * FreeBSD: Use struct fid, as file handles larger then MAXFIDSZ are unsupported
  */
-#define FHANDLE_HEADERLEN 8
-struct kernfid {
-	unsigned short	fid_len;		/* length of data in bytes */
-	unsigned short	fid_reserved;		/* compat: historic align */
-	char		fid_data[0];		/* data (variable length) */
-};
 
 /*ARGSUSED*/
 static void *
 fhcmp(struct puffs_usermount *pu, struct puffs_node *pn, void *arg)
 {
-	struct kernfid *kf1, *kf2;
+	struct fid *kf1, *kf2;
 
 	if ((kf1 = pn->pn_data) == NULL)
 		return NULL;
@@ -242,13 +240,16 @@ puffs_null_fs_fhtonode(struct puffs_usermount *pu, void *fid, size_t fidsize,
 {
 	struct puffs_node *pn_res;
 
+	if (fidsize != sizeof(struct fid))
+		return EINVAL;
+
 	pn_res = puffs_pn_nodewalk(pu, fhcmp, fid);
 	if (pn_res == NULL)
 		return ENOENT;
 
 	puffs_newinfo_setcookie(pni, pn_res);
 	puffs_newinfo_setvtype(pni, pn_res->pn_va.va_type);
-	puffs_newinfo_setsize(pni, (voff_t)pn_res->pn_va.va_size);
+	puffs_newinfo_setsize(pni, (off_t)pn_res->pn_va.va_size);
 	puffs_newinfo_setrdev(pni, pn_res->pn_va.va_rdev);
 	return 0;
 }
@@ -259,34 +260,22 @@ puffs_null_fs_nodetofh(struct puffs_usermount *pu, puffs_cookie_t opc,
 	void *fid, size_t *fidsize)
 {
 	struct puffs_node *pn = opc;
-	struct kernfid *kfid;
-	void *bounce;
+	fhandle_t fh;
 	int rv;
 
+	if (*fidsize != sizeof(struct fid))
+		return EINVAL;
+
 	rv = 0;
-	bounce = NULL;
-	if (*fidsize) {
-		bounce = malloc(*fidsize + FHANDLE_HEADERLEN);
-		if (!bounce)
-			return ENOMEM;
-		*fidsize += FHANDLE_HEADERLEN;
-	}
-	if (getfh(PNPATH(pn), bounce, fidsize) == -1)
+	if (getfh(PNPATH(pn), &fh) == -1)
 		rv = errno;
-	else
-		memcpy(fid, (uint8_t *)bounce + FHANDLE_HEADERLEN,
-		    *fidsize - FHANDLE_HEADERLEN);
-	kfid = fid;
 	if (rv == 0) {
-		*fidsize = kfid->fid_len;
+		*(struct fid *)fid = fh.fh_fid;
 		pn->pn_data = malloc(*fidsize);
 		if (pn->pn_data == NULL)
 			abort(); /* lazy */
 		memcpy(pn->pn_data, fid, *fidsize);
-	} else {
-		*fidsize -= FHANDLE_HEADERLEN;
 	}
-	free(bounce);
 
 	return rv;
 }
@@ -323,7 +312,7 @@ puffs_null_node_lookup(struct puffs_usermount *pu, puffs_cookie_t opc,
 
 	puffs_newinfo_setcookie(pni, pn_res);
 	puffs_newinfo_setvtype(pni, pn_res->pn_va.va_type);
-	puffs_newinfo_setsize(pni, (voff_t)pn_res->pn_va.va_size);
+	puffs_newinfo_setsize(pni, (off_t)pn_res->pn_va.va_size);
 	puffs_newinfo_setrdev(pni, pn_res->pn_va.va_rdev);
 
 	return 0;
@@ -358,8 +347,19 @@ puffs_null_node_mknod(struct puffs_usermount *pu, puffs_cookie_t opc,
 	int rv;
 
 	mode = puffs_addvtype2mode(va->va_mode, va->va_type);
-	if (mknod(PCNPATH(pcn), mode, va->va_rdev) == -1)
-		return errno;
+	switch (va->va_type) {
+	case VFIFO:
+		if (mkfifo(PCNPATH(pcn), mode) == -1)
+			return errno;
+		break;
+	case VCHR:
+	case VBLK:
+		if (mknod(PCNPATH(pcn), mode, va->va_rdev) == -1)
+			return errno;
+		break;
+	default:
+		return EINVAL;
+	}
 
 	rv = makenode(pu, pni, pcn, va, 0);
 	if (rv)
@@ -414,14 +414,7 @@ puffs_null_node_fsync(struct puffs_usermount *pu, puffs_cookie_t opc,
 	if (fd == -1)
 		return errno;
 
-	if (how & PUFFS_FSYNC_DATAONLY)
-		fflags = FDATASYNC;
-	else
-		fflags = FFILESYNC;
-	if (how & PUFFS_FSYNC_CACHE)
-		fflags |= FDISKSYNC;
-
-	if (fsync_range(fd, fflags, offlo, offhi - offlo) == -1)
+	if (fsync(fd) == -1)
 		rv = errno;
 
 	close(fd);

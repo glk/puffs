@@ -39,7 +39,6 @@ __RCSID("$NetBSD: refuse.c,v 1.92 2009/03/05 01:21:57 msaitoh Exp $");
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
-#include <fuse.h>
 #include <paths.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +47,10 @@ __RCSID("$NetBSD: refuse.c,v 1.92 2009/03/05 01:21:57 msaitoh Exp $");
 #ifdef MULTITHREADED_REFUSE
 #include <pthread.h>
 #endif
+
+#include <puffs_dirent_compat.h>
+
+#include "fuse.h"
 
 typedef uint64_t	 fuse_ino_t;
 
@@ -608,6 +611,9 @@ puffs_fuse_node_lookup(struct puffs_usermount *pu, void *opc,
 
 	set_fuse_context_uid_gid(pcn->pcn_cred);
 
+	if (fuse->op.getattr == NULL) {
+		return ENOSYS;
+	}
 	ret = fuse->op.getattr(path, &st);
 
 	if (ret != 0) {
@@ -616,7 +622,7 @@ puffs_fuse_node_lookup(struct puffs_usermount *pu, void *opc,
 
 	/* XXX: fiXXXme unconst */
 	pn_res = puffs_pn_nodewalk(pu, puffs_path_walkcmp,
-	    __UNCONST(&pcn->pcn_po_full));
+	    __DECONST(void*, &pcn->pcn_po_full));
 	if (pn_res == NULL) {
 		pn_res = newrn(pu);
 		if (pn_res == NULL)
@@ -626,7 +632,7 @@ puffs_fuse_node_lookup(struct puffs_usermount *pu, void *opc,
 
 	puffs_newinfo_setcookie(pni, pn_res);
 	puffs_newinfo_setvtype(pni, pn_res->pn_va.va_type);
-	puffs_newinfo_setsize(pni, (voff_t)pn_res->pn_va.va_size);
+	puffs_newinfo_setsize(pni, (off_t)pn_res->pn_va.va_size);
 	puffs_newinfo_setrdev(pni, pn_res->pn_va.va_rdev);
 
 	return 0;
@@ -767,6 +773,8 @@ puffs_fuse_node_create(struct puffs_usermount *pu, void *opc,
 
 	created = 0;
 	if (fuse->op.create) {
+		bzero(&fi, sizeof(fi));
+		fi.flags = O_CREAT | O_EXCL | O_WRONLY;
 		ret = fuse->op.create(path, mode | S_IFREG, &fi);
 		if (ret == 0)
 			created = 1;
@@ -1192,18 +1200,31 @@ puffs_fuse_fs_sync(struct puffs_usermount *pu, int flags,
 
 /* ARGSUSED2 */
 static int
-puffs_fuse_fs_statvfs(struct puffs_usermount *pu, struct statvfs *svfsb)
+puffs_fuse_fs_statvfs(struct puffs_usermount *pu, struct statfs *sfsb)
 {
 	struct fuse		*fuse;
 	int			ret;
 
 	fuse = puffs_getspecific(pu);
 	if (fuse->op.statfs == NULL) {
-		if ((ret = statvfs(PNPATH(puffs_getroot(pu)), svfsb)) == -1) {
+		if ((ret = statfs(PNPATH(puffs_getroot(pu)), sfsb)) == -1) {
 			return errno;
 		}
 	} else {
-		ret = fuse->op.statfs(PNPATH(puffs_getroot(pu)), svfsb);
+		struct statvfs svfsb;
+		ret = fuse->op.statfs(PNPATH(puffs_getroot(pu)), &svfsb);
+		if (ret == 0) {
+			puffs_zerostatvfs(sfsb);
+			sfsb->f_bavail = svfsb.f_bavail;
+			sfsb->f_bfree = svfsb.f_bfree;
+			sfsb->f_blocks = svfsb.f_blocks;
+			sfsb->f_ffree = svfsb.f_ffree;
+			sfsb->f_files = svfsb.f_files;
+			sfsb->f_iosize = svfsb.f_bsize;
+			sfsb->f_flags = svfsb.f_flag;
+			sfsb->f_bsize = svfsb.f_frsize;
+			sfsb->f_namemax = svfsb.f_namemax;
+		}
 	}
 
         return -ret;
@@ -1275,7 +1296,7 @@ fuse_new(struct fuse_chan *fc, struct fuse_args *args,
 	struct puffs_node	*pn_root;
 	struct puffs_ops	*pops;
 	struct refusenode	*rn_root;
-	struct statvfs		 svfsb;
+	struct statfs		 svfsb;
 	struct stat		 st;
 	struct fuse		*fuse;
 	extern int		 puffs_fakecc;
@@ -1367,7 +1388,7 @@ fuse_new(struct fuse_chan *fc, struct fuse_args *args,
 	puffs_set_prepost(pu, set_fuse_context_pid, NULL);
 
 	puffs_zerostatvfs(&svfsb);
-	if (puffs_mount(pu, fc->dir, MNT_NODEV | MNT_NOSUID, pn_root) == -1) {
+	if (puffs_mount(pu, fc->dir, MNT_NOSUID, pn_root) == -1) {
 		err(EXIT_FAILURE, "puffs_mount: directory \"%s\"", fc->dir);
 	}
 

@@ -1,20 +1,18 @@
-# $NetBSD: Makefile,v 1.8 2007/11/05 13:41:52 pooka Exp $
-
-USE_FORT?=	yes	# data driven bugs?
-
 LIB=		refuse
-LIBDPLIBS+=	puffs	${.CURDIR}/../libpuffs		\
-		pthread	${.CURDIR}/../libpthread
 
 .ifdef DEBUG
 FUSE_OPT_DEBUG_FLAGS=	-g -DFUSE_OPT_DEBUG
 .endif
 
+MOUNT=  /usr/src/sbin/mount
+.PATH:  ${MOUNT}
+
+CFLAGS+=	-DMULTITHREADED_REFUSE
 CFLAGS+=	${FUSE_OPT_DEBUG_FLAGS}
+CFLAGS+=	-g -I${.CURDIR}/../libpuffs -I${.CURDIR}/../putter -I${.CURDIR}/../puffs -I${MOUNT}
 SRCS=		refuse.c refuse_opt.c
 MAN=		refuse.3
-WARNS=		4
-INCS=           fuse.h fuse_opt.h
-INCSDIR=        /usr/include
+WARNS=		2
+#SHLIB_MAJOR=	1
 
 .include <bsd.lib.mk>

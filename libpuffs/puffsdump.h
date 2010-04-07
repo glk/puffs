@@ -30,7 +30,7 @@
 #ifndef _PUFFSDUMP_H_
 #define _PUFFSDUMP_H_
 
-#include <fs/puffs/puffs_msgif.h>
+#include <puffs_msgif.h>
 
 void puffsdump_req(struct puffs_req *);
 void puffsdump_rv(struct puffs_req *);

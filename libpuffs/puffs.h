@@ -37,15 +37,19 @@
 #include <sys/mount.h>
 #include <sys/namei.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/vnode.h>
+#include <sys/uio.h>
 
-#include <fs/puffs/puffs_msgif.h>
+#include <puffs_msgif.h>
 
 #include <mntopts.h>
 #include <stdbool.h>
 #include <string.h>
+
+/* XXX_TS paths.h, sys/mount.h in NetBSD */
+#define	_PATH_PUFFS	"/dev/putter"
+#define	MOUNT_PUFFS	"puffs"		/* Pass-to-Userspace filesystem */
 
 /* forwards */
 struct puffs_cc;
@@ -152,7 +156,7 @@ extern const struct mntopt puffsmopts[]; /* puffs.c */
 /* callbacks for operations */
 struct puffs_ops {
 	int (*puffs_fs_unmount)(struct puffs_usermount *, int);
-	int (*puffs_fs_statvfs)(struct puffs_usermount *, struct statvfs *);
+	int (*puffs_fs_statvfs)(struct puffs_usermount *, struct statfs *);
 	int (*puffs_fs_sync)(struct puffs_usermount *, int,
 	    const struct puffs_cred *);
 	int (*puffs_fs_fhtonode)(struct puffs_usermount *, void *, size_t,
@@ -279,7 +283,7 @@ enum {
 #define PUFFSOP_PROTOS(fsname)						\
 	int fsname##_fs_unmount(struct puffs_usermount *, int);		\
 	int fsname##_fs_statvfs(struct puffs_usermount *,		\
-	    struct statvfs *);						\
+	    struct statfs *);						\
 	int fsname##_fs_sync(struct puffs_usermount *, int,		\
 	    const struct puffs_cred *cred);				\
 	int fsname##_fs_fhtonode(struct puffs_usermount *, void *,	\
@@ -436,7 +440,7 @@ void			puffs_setroot(struct puffs_usermount *,
 				      struct puffs_node *);
 struct puffs_node 	*puffs_getroot(struct puffs_usermount *);
 void			puffs_setrootinfo(struct puffs_usermount *,
-					  enum vtype, vsize_t, dev_t); 
+					  enum vtype, size_t, dev_t);
 
 void			*puffs_getspecific(struct puffs_usermount *);
 void			puffs_setspecific(struct puffs_usermount *, void *);
@@ -461,7 +465,7 @@ struct puffs_usermount	*puffs_pn_getmnt(struct puffs_node *);
 
 void	puffs_newinfo_setcookie(struct puffs_newinfo *, puffs_cookie_t);
 void	puffs_newinfo_setvtype(struct puffs_newinfo *, enum vtype);
-void	puffs_newinfo_setsize(struct puffs_newinfo *, voff_t);
+void	puffs_newinfo_setsize(struct puffs_newinfo *, off_t);
 void	puffs_newinfo_setrdev(struct puffs_newinfo *, dev_t);
 
 void			*puffs_pn_getmntspecific(struct puffs_node *);
@@ -486,8 +490,8 @@ int			puffs_dispatch_exec(struct puffs_cc *,
  * generic/dummy routines applicable for some file systems
  */
 int  puffs_fsnop_unmount(struct puffs_usermount *, int);
-int  puffs_fsnop_statvfs(struct puffs_usermount *, struct statvfs *);
-void puffs_zerostatvfs(struct statvfs *);
+int  puffs_fsnop_statvfs(struct puffs_usermount *, struct statfs *);
+void puffs_zerostatvfs(struct statfs *);
 int  puffs_fsnop_sync(struct puffs_usermount *, int waitfor,
 		      const struct puffs_cred *);
 

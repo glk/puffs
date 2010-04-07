@@ -29,7 +29,7 @@
 #define _PUFFS_PRIVATE_H_
 
 #include <sys/types.h>
-#include <fs/puffs/puffs_msgif.h>
+#include <puffs_msgif.h>
 
 #include <puffs.h>
 #include <ucontext.h>
@@ -202,7 +202,7 @@ struct puffs_cc {
 struct puffs_newinfo {
 	void		**pni_cookie;
 	enum vtype	*pni_vtype;
-	voff_t		*pni_size;
+	off_t		*pni_size;
 	dev_t		*pni_rdev;
 };
 

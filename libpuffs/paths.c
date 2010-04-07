@@ -176,10 +176,10 @@ puffs_path_buildhash(struct puffs_usermount *pu, struct puffs_pathobj *po)
 
 	if (pu->pu_pathbuild == puffs_stdpath_buildpath)
 		po->po_hash = hash32_strn(po->po_path, po->po_len,
-		    HASH32_STR_INIT);
+		    HASHINIT);
 	else
 		po->po_hash = hash32_buf(po->po_path, po->po_len,
-		    HASH32_BUF_INIT);
+		    HASHINIT);
 }
 
 /*

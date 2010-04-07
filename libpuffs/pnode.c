@@ -162,7 +162,7 @@ puffs_newinfo_setvtype(struct puffs_newinfo *pni, enum vtype vt)
 }
 
 void
-puffs_newinfo_setsize(struct puffs_newinfo *pni, voff_t size)
+puffs_newinfo_setsize(struct puffs_newinfo *pni, off_t size)
 {
 
 	*pni->pni_size = size;

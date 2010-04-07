@@ -180,15 +180,28 @@ slowccalloc(struct puffs_usermount *pu)
 	struct puffs_cc *volatile pcc;
 	void *sp;
 	size_t stacksize = 1<<pu->pu_cc_stackshift;
+	size_t stackalign;
 	long psize = sysconf(_SC_PAGESIZE);
 
 	if (puffs_fakecc)
 		return &fakecc;
 
-	sp = mmap(NULL, stacksize, PROT_READ|PROT_WRITE,
-	    MAP_ANON|MAP_PRIVATE|MAP_ALIGNED(pu->pu_cc_stackshift), -1, 0);
+	/* 
+	 * Emulate MAP_ALIGNED(pu->pu_cc_stackshift) by allocating stacksize*2
+	 * bytes and unmapping extra pages
+	 */
+	sp = mmap(NULL, stacksize * 2, PROT_READ|PROT_WRITE,
+	    MAP_ANON|MAP_PRIVATE, -1, 0);
 	if (sp == MAP_FAILED)
 		return NULL;
+	stackalign = ((uintptr_t)sp) & (stacksize-1);
+	if (stackalign != 0) {
+		munmap(sp, stacksize - stackalign); 
+		sp = (uint8_t *)sp + stacksize - stackalign;
+		munmap((uint8_t *)sp + stacksize, stackalign); 
+	} else {
+		munmap((uint8_t *)sp + stacksize, stacksize); 
+	}
 
 	pcc = sp;
 	memset(pcc, 0, sizeof(struct puffs_cc));
@@ -246,7 +259,7 @@ puffs__cc_create(struct puffs_usermount *pu, puffs_ccfunc func,
 		 * swapcontext().  However, it gets lost.  So reinit it.
 		 */
 		st = &pcc->pcc_uc.uc_stack;
-		st->ss_sp = pcc;
+		st->ss_sp = (void *)pcc;
 		st->ss_size = stacksize;
 		st->ss_flags = 0;
 

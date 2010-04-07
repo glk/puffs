@@ -35,83 +35,31 @@
  */
 
 #include <sys/cdefs.h>
-__KERNEL_RCSID(0, "$NetBSD: putter.c,v 1.23 2009/04/11 23:05:26 christos Exp $");
+/*
+__KERNEL_RCSID(0, "$NetBSD: putter.c,v 1.16 2008/08/08 13:02:10 pooka Exp $");
+*/
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
-#include <sys/file.h>
-#include <sys/filedesc.h>
-#include <sys/kmem.h>
+#include <sys/fcntl.h>
+#include <sys/filio.h>
 #include <sys/poll.h>
-#include <sys/stat.h>
-#include <sys/socketvar.h>
+#include <sys/malloc.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/kernel.h>
 #include <sys/module.h>
-#include <sys/kauth.h>
+#include <sys/selinfo.h>
+#include <sys/uio.h>
 
-#include <dev/putter/putter_sys.h>
+#include <putter_sys.h>
 
-/*
- * Device routines.  These are for when /dev/puffs is initially
- * opened before it has been cloned.
- */
+#define DEVICE_NAME	"putter"
 
-dev_type_open(puttercdopen);
-dev_type_close(puttercdclose);
-dev_type_ioctl(puttercdioctl);
+static MALLOC_DEFINE(M_PUTTER, DEVICE_NAME, "Putter device data");
 
-/* dev */
-const struct cdevsw putter_cdevsw = {
-	puttercdopen,	puttercdclose,	noread,		nowrite,
-	noioctl,	nostop,		notty,		nopoll,
-	nommap,		nokqfilter,	D_OTHER
-};
-
-/*
- * Configuration data.
- *
- * This is static-size for now.  Will be redone for devfs.
- */
-
-#define PUTTER_CONFSIZE 16
-
-static struct putter_config {
-	int	pc_minor;
-	int	(*pc_config)(int, int, int);
-} putterconf[PUTTER_CONFSIZE];
-
-static int
-putter_configure(dev_t dev, int flags, int fmt, int fd)
-{
-	struct putter_config *pc;
-
-	/* are we the catch-all node? */
-	if (minor(dev) == PUTTER_MINOR_WILDCARD
-	    || minor(dev) == PUTTER_MINOR_COMPAT)
-		return 0;
-
-	/* nopes?  try to configure us */
-	for (pc = putterconf; pc->pc_config; pc++)
-		if (minor(dev) == pc->pc_minor)
-			return pc->pc_config(fd, flags, fmt);
-	return ENXIO;
-}
-
-int
-putter_register(putter_config_fn pcfn, int minor)
-{
-	int i;
-
-	for (i = 0; i < PUTTER_CONFSIZE; i++)
-		if (putterconf[i].pc_config == NULL)
-			break;
-	if (i == PUTTER_CONFSIZE)
-		return EBUSY;
-
-	putterconf[i].pc_minor = minor;
-	putterconf[i].pc_config = pcfn;
-	return 0;
-}
+static struct clonedevs *putter_dev_clones = NULL;
 
 /*
  * putter instance structures.  these are always allocated and freed
@@ -119,8 +67,7 @@ putter_register(putter_config_fn pcfn, int minor)
  */
 struct putter_instance {
 	pid_t			pi_pid;
-	int			pi_idx;
-	int			pi_fd;
+	int			pi_idx;	/* device unit number */
 	struct selinfo		pi_sel;
 
 	void			*pi_private;
@@ -129,9 +76,6 @@ struct putter_instance {
 	uint8_t			*pi_curput;
 	size_t			pi_curres;
 	void			*pi_curopaq;
-	struct timespec		pi_atime;
-	struct timespec		pi_mtime;
-	struct timespec		pi_btime;
 
 	TAILQ_ENTRY(putter_instance) pi_entries;
 };
@@ -141,8 +85,6 @@ struct putter_instance {
 static TAILQ_HEAD(, putter_instance) putter_ilist
     = TAILQ_HEAD_INITIALIZER(putter_ilist);
 
-static int get_pi_idx(struct putter_instance *);
-
 #ifdef DEBUG
 #ifndef PUTTERDEBUG
 #define PUTTERDEBUG
@@ -150,7 +92,7 @@ static int get_pi_idx(struct putter_instance *);
 #endif
 
 #ifdef PUTTERDEBUG
-int putterdebug = 0;
+int putterdebug = 1;
 #define DPRINTF(x) if (putterdebug > 0) printf x
 #define DPRINTF_VERBOSE(x) if (putterdebug > 1) printf x
 #else
@@ -163,75 +105,25 @@ int putterdebug = 0;
  */
 
 /* protects both the list and the contents of the list elements */
-static kmutex_t pi_mtx;
-
-void putterattach(void);
-
-void
-putterattach(void)
-{
-
-	mutex_init(&pi_mtx, MUTEX_DEFAULT, IPL_NONE);
-}
-
-#if 0
-void
-putter_destroy(void)
-{
-
-	mutex_destroy(&pi_mtx);
-}
-#endif
-
-/*
- * fd routines, for cloner
- */
-static int putter_fop_read(file_t *, off_t *, struct uio *,
-			   kauth_cred_t, int);
-static int putter_fop_write(file_t *, off_t *, struct uio *,
-			    kauth_cred_t, int);
-static int putter_fop_ioctl(file_t*, u_long, void *);
-static int putter_fop_poll(file_t *, int);
-static int putter_fop_stat(file_t *, struct stat *);
-static int putter_fop_close(file_t *);
-static int putter_fop_kqfilter(file_t *, struct knote *);
-
-
-static const struct fileops putter_fileops = {
-	.fo_read = putter_fop_read,
-	.fo_write = putter_fop_write,
-	.fo_ioctl = putter_fop_ioctl,
-	.fo_fcntl = fnullop_fcntl,
-	.fo_poll = putter_fop_poll,
-	.fo_stat = putter_fop_stat,
-	.fo_close = putter_fop_close,
-	.fo_kqfilter = putter_fop_kqfilter,
-	.fo_drain = fnullop_drain,
-};
+static struct mtx pi_mtx;
 
 static int
-putter_fop_read(file_t *fp, off_t *off, struct uio *uio,
-	kauth_cred_t cred, int flags)
+putter_fop_read(struct cdev *dev, struct uio *uio, int flags)
 {
-	struct putter_instance *pi = fp->f_data;
+	struct putter_instance *pi = dev->si_drv1;
 	size_t origres, moved;
 	int error;
 
-	KERNEL_LOCK(1, NULL);
-	getnanotime(&pi->pi_atime);
-
 	if (pi->pi_private == PUTTER_EMBRYO || pi->pi_private == PUTTER_DEAD) {
 		printf("putter_fop_read: private %d not inited\n", pi->pi_idx);
-		KERNEL_UNLOCK_ONE(NULL);
 		return ENOENT;
 	}
 
 	if (pi->pi_curput == NULL) {
 		error = pi->pi_pop->pop_getout(pi->pi_private, uio->uio_resid,
-		    fp->f_flag & O_NONBLOCK, &pi->pi_curput,
+		    flags & O_NONBLOCK, &pi->pi_curput,
 		    &pi->pi_curres, &pi->pi_curopaq);
 		if (error) {
-			KERNEL_UNLOCK_ONE(NULL);
 			return error;
 		}
 	}
@@ -242,7 +134,7 @@ putter_fop_read(file_t *fp, off_t *off, struct uio *uio,
 	DPRINTF(("putter_fop_read (%p): moved %zu bytes from %p, error %d\n",
 	    pi, moved, pi->pi_curput, error));
 
-	KASSERT(pi->pi_curres >= moved);
+	KASSERT(pi->pi_curres >= moved, ("pi->pi_curres >= moved"));
 	pi->pi_curres -= moved;
 	pi->pi_curput += moved;
 
@@ -252,55 +144,46 @@ putter_fop_read(file_t *fp, off_t *off, struct uio *uio,
 		pi->pi_curput = NULL;
 	}
 
-	KERNEL_UNLOCK_ONE(NULL);
 	return error;
 }
 
 static int
-putter_fop_write(file_t *fp, off_t *off, struct uio *uio,
-	kauth_cred_t cred, int flags)
+putter_fop_write(struct cdev *dev, struct uio *uio, int flags)
 {
-	struct putter_instance *pi = fp->f_data;
+	struct putter_instance *pi = dev->si_drv1;
 	struct putter_hdr pth;
 	uint8_t *buf;
 	size_t frsize;
 	int error;
-
-	KERNEL_LOCK(1, NULL);
-	getnanotime(&pi->pi_mtime);
 
 	DPRINTF(("putter_fop_write (%p): writing response, resid %zu\n",
 	    pi->pi_private, uio->uio_resid));
 
 	if (pi->pi_private == PUTTER_EMBRYO || pi->pi_private == PUTTER_DEAD) {
 		printf("putter_fop_write: putter %d not inited\n", pi->pi_idx);
-		KERNEL_UNLOCK_ONE(NULL);
 		return ENOENT;
 	}
 
 	error = uiomove(&pth, sizeof(struct putter_hdr), uio);
 	if (error) {
-		KERNEL_UNLOCK_ONE(NULL);
 		return error;
 	}
 
 	/* Sorry mate, the kernel doesn't buffer. */
 	frsize = pth.pth_framelen - sizeof(struct putter_hdr);
 	if (uio->uio_resid < frsize) {
-		KERNEL_UNLOCK_ONE(NULL);
 		return EINVAL;
 	}
 
-	buf = kmem_alloc(frsize + sizeof(struct putter_hdr), KM_SLEEP);
+	buf = malloc(frsize + sizeof(struct putter_hdr), M_PUTTER, M_WAITOK);
 	memcpy(buf, &pth, sizeof(pth));
 	error = uiomove(buf+sizeof(struct putter_hdr), frsize, uio);
 	if (error == 0) {
 		pi->pi_pop->pop_dispatch(pi->pi_private,
 		    (struct putter_hdr *)buf);
 	}
-	kmem_free(buf, frsize + sizeof(struct putter_hdr));
+	free(buf, M_PUTTER);
 
-	KERNEL_UNLOCK_ONE(NULL);
 	return error;
 }
 
@@ -310,22 +193,18 @@ putter_fop_write(file_t *fp, off_t *off, struct uio *uio,
  */
 #define PUTTERPOLL_EVSET (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI)
 static int
-putter_fop_poll(file_t *fp, int events)
+putter_fop_poll(struct cdev *dev, int events, struct thread *td)
 {
-	struct putter_instance *pi = fp->f_data;
+	struct putter_instance *pi = dev->si_drv1;
 	int revents;
-
-	KERNEL_LOCK(1, NULL);
 
 	if (pi->pi_private == PUTTER_EMBRYO || pi->pi_private == PUTTER_DEAD) {
 		printf("putter_fop_ioctl: putter %d not inited\n", pi->pi_idx);
-		KERNEL_UNLOCK_ONE(NULL);
 		return ENOENT;
 	}
 
 	revents = events & (POLLOUT | POLLWRNORM | POLLWRBAND);
 	if ((events & PUTTERPOLL_EVSET) == 0) {
-		KERNEL_UNLOCK_ONE(NULL);
 		return revents;
 	}
 
@@ -333,9 +212,8 @@ putter_fop_poll(file_t *fp, int events)
 	if (pi->pi_pop->pop_waitcount(pi->pi_private))
 		revents |= PUTTERPOLL_EVSET;
 	else
-		selrecord(curlwp, &pi->pi_sel);
+		selrecord(curthread, &pi->pi_sel);
 
-	KERNEL_UNLOCK_ONE(NULL);
 	return revents;
 }
 
@@ -345,17 +223,14 @@ putter_fop_poll(file_t *fp, int events)
  * unmounting is a frightfully complex operation to avoid races
  */
 static int
-putter_fop_close(file_t *fp)
+putter_fop_close(struct cdev *dev, int flag, int fmt, struct thread *td)
 {
-	struct putter_instance *pi = fp->f_data;
-	int rv;
+	struct putter_instance *pi = dev->si_drv1;
 
 	DPRINTF(("putter_fop_close: device closed\n"));
 
-	KERNEL_LOCK(1, NULL);
-
  restart:
-	mutex_enter(&pi_mtx);
+	mtx_lock(&pi_mtx);
 	/*
 	 * First check if the fs was never mounted.  In that case
 	 * remove the instance from the list.  If mount is attempted later,
@@ -363,10 +238,10 @@ putter_fop_close(file_t *fp)
 	 */
 	if (pi->pi_private == PUTTER_EMBRYO) {
 		TAILQ_REMOVE(&putter_ilist, pi, pi_entries);
-		mutex_exit(&pi_mtx);
+		mtx_unlock(&pi_mtx);
 
-		DPRINTF(("putter_fop_close: data associated with fp %p was "
-		    "embryonic\n", fp));
+		DPRINTF(("putter_fop_close: data associated with dev %p was "
+		    "embryonic\n", dev));
 
 		goto out;
 	}
@@ -377,10 +252,10 @@ putter_fop_close(file_t *fp)
 	 * was removed from the list by putter_rmprivate().
 	 */
 	if (pi->pi_private == PUTTER_DEAD) {
-		mutex_exit(&pi_mtx);
+		mtx_unlock(&pi_mtx);
 
-		DPRINTF(("putter_fop_close: putter associated with fp %p (%d) "
-		    "dead, freeing\n", fp, pi->pi_idx));
+		DPRINTF(("putter_fop_close: putter associated with dev %p (%d) "
+		    "dead, freeing\n", dev, pi->pi_idx));
 
 		goto out;
 	}
@@ -388,43 +263,28 @@ putter_fop_close(file_t *fp)
 	/*
 	 * So we have a reference.  Proceed to unwrap the file system.
 	 */
-	mutex_exit(&pi_mtx);
+	mtx_unlock(&pi_mtx);
 
 	/* hmm?  suspicious locking? */
-	while ((rv = pi->pi_pop->pop_close(pi->pi_private)) == ERESTART)
+	while (pi->pi_pop->pop_close(pi->pi_private) == ERESTART)
 		goto restart;
 
  out:
-	KERNEL_UNLOCK_ONE(NULL);
 	/*
 	 * Finally, release the instance information.  It was already
 	 * removed from the list by putter_rmprivate() and we know it's
 	 * dead, so no need to lock.
 	 */
-	kmem_free(pi, sizeof(struct putter_instance));
 
-	return 0;
+	knlist_destroy(&pi->pi_sel.si_note);
+	free(pi, M_PUTTER);
+
+	return (0);
 }
 
 static int
-putter_fop_stat(file_t *fp, struct stat *st)
-{
-	struct putter_instance *pi = fp->f_data;
-
-	(void)memset(st, 0, sizeof(*st));
-	KERNEL_LOCK(1, NULL);
-	st->st_dev = makedev(cdevsw_lookup_major(&putter_cdevsw), pi->pi_idx);
-	st->st_atimespec = pi->pi_atime;
-	st->st_mtimespec = pi->pi_mtime;
-	st->st_ctimespec = st->st_birthtimespec = pi->pi_btime;
-	st->st_uid = kauth_cred_geteuid(fp->f_cred);
-	st->st_gid = kauth_cred_getegid(fp->f_cred);
-	KERNEL_UNLOCK_ONE(NULL);
-	return 0;
-}
-
-static int
-putter_fop_ioctl(file_t *fp, u_long cmd, void *data)
+putter_fop_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flags,
+    struct thread *td)
 {
 
 	/*
@@ -444,11 +304,9 @@ filt_putterdetach(struct knote *kn)
 {
 	struct putter_instance *pi = kn->kn_hook;
 
-	KERNEL_LOCK(1, NULL);
-	mutex_enter(&pi_mtx);
-	SLIST_REMOVE(&pi->pi_sel.sel_klist, kn, knote, kn_selnext);
-	mutex_exit(&pi_mtx);
-	KERNEL_UNLOCK_ONE(NULL);
+	mtx_lock(&pi_mtx);
+	knlist_remove(&pi->pi_sel.si_note, kn, 1);
+	mtx_unlock(&pi_mtx);
 }
 
 static int
@@ -457,110 +315,131 @@ filt_putter(struct knote *kn, long hint)
 	struct putter_instance *pi = kn->kn_hook;
 	int error, rv;
 
-	KERNEL_LOCK(1, NULL);
+	mtx_assert(&pi_mtx, MA_OWNED);
 	error = 0;
-	mutex_enter(&pi_mtx);
 	if (pi->pi_private == PUTTER_EMBRYO || pi->pi_private == PUTTER_DEAD)
 		error = 1;
-	mutex_exit(&pi_mtx);
 	if (error) {
-		KERNEL_UNLOCK_ONE(NULL);
 		return 0;
 	}
 
 	kn->kn_data = pi->pi_pop->pop_waitcount(pi->pi_private);
 	rv = kn->kn_data != 0;
-	KERNEL_UNLOCK_ONE(NULL);
 	return rv;
 }
 
-static const struct filterops putter_filtops =
-	{ 1, NULL, filt_putterdetach, filt_putter };
+static struct filterops putter_filtops = {
+	.f_isfd =	1,
+	.f_attach =	NULL,
+	.f_detach =	filt_putterdetach,
+	.f_event =	filt_putter,
+};
 
 static int
-putter_fop_kqfilter(file_t *fp, struct knote *kn)
+filt_putter_seltrue(struct knote *kn, long hint)
 {
-	struct putter_instance *pi = fp->f_data;
-	struct klist *klist;
+        /*
+         * We don't know how much data can be read/written,
+         * but we know that it *can* be.  This is about as
+         * good as select/poll does as well.
+         */
+        kn->kn_data = 0;
+        return (1);
+}
 
-	KERNEL_LOCK(1, NULL);
+/*
+ * This provides full kqfilter entry for device switch tables, which
+ * has same effect as filter using filt_seltrue() as filter method.
+ */
+static void
+filt_putter_seltruedetach(struct knote *kn)
+{
+        /* Nothing to do */
+}
+
+static struct filterops putter_seltrue_filtops = {
+	.f_isfd =	1,
+	.f_attach =	NULL,
+	.f_detach =	filt_putter_seltruedetach,
+	.f_event =	filt_putter_seltrue,
+};
+
+
+static int
+putter_fop_kqfilter(struct cdev *dev, struct knote *kn)
+{
+	struct putter_instance *pi = dev->si_drv1;
 
 	switch (kn->kn_filter) {
 	case EVFILT_READ:
-		klist = &pi->pi_sel.sel_klist;
 		kn->kn_fop = &putter_filtops;
 		kn->kn_hook = pi;
 
-		mutex_enter(&pi_mtx);
-		SLIST_INSERT_HEAD(klist, kn, kn_selnext);
-		mutex_exit(&pi_mtx);
+		mtx_lock(&pi_mtx);
+		knlist_add(&pi->pi_sel.si_note, kn, 1);
+		mtx_unlock(&pi_mtx);
 
 		break;
 	case EVFILT_WRITE:
-		kn->kn_fop = &seltrue_filtops;
+		kn->kn_fop = &putter_seltrue_filtops;
 		break;
 	default:
-		KERNEL_UNLOCK_ONE(NULL);
 		return EINVAL;
 	}
 
-	KERNEL_UNLOCK_ONE(NULL);
 	return 0;
 }
 
-int
-puttercdopen(dev_t dev, int flags, int fmt, struct lwp *l)
+static	d_open_t	puttercdopen;
+
+/* dev */
+struct cdevsw putter_cdevsw = {
+	.d_version =	D_VERSION,
+	.d_flags =	D_PSEUDO | D_NEEDMINOR,
+	.d_open =	puttercdopen,
+	.d_close =	putter_fop_close,
+	.d_read =	putter_fop_read,
+	.d_write =	putter_fop_write,
+	.d_ioctl =	putter_fop_ioctl,
+	.d_poll =	putter_fop_poll,
+	.d_kqfilter =	putter_fop_kqfilter,
+	.d_name =	DEVICE_NAME,
+};
+
+static int
+puttercdopen(struct cdev *dev, int flags, int fmt, struct thread *td)
 {
 	struct putter_instance *pi;
-	file_t *fp;
-	int error, fd, idx;
-	proc_t *p;
+	int error;
+	pid_t pid;
 
-	p = curproc;
-	pi = kmem_alloc(sizeof(struct putter_instance), KM_SLEEP);
-	mutex_enter(&pi_mtx);
-	idx = get_pi_idx(pi);
+	pid = td->td_proc->p_pid;
+	pi = dev->si_drv1;
 
-	pi->pi_pid = p->p_pid;
-	pi->pi_idx = idx;
-	pi->pi_curput = NULL;
-	pi->pi_curres = 0;
-	pi->pi_curopaq = NULL;
-	getnanotime(&pi->pi_btime);
-	pi->pi_atime = pi->pi_mtime = pi->pi_btime;
-	selinit(&pi->pi_sel);
-	mutex_exit(&pi_mtx);
+	if (pi != NULL) {
+		mtx_lock(&pi_mtx);
+		error = (pi->pi_pid == pid ? 0 : EBUSY);
+		mtx_unlock(&pi_mtx);
+		return (error);
+	}
 
-	if ((error = fd_allocfile(&fp, &fd)) != 0)
-		goto bad1;
+	pi = malloc(sizeof(struct putter_instance), M_PUTTER, M_WAITOK | M_ZERO);
+	dev->si_drv1 = pi;
 
-	if ((error = putter_configure(dev, flags, fmt, fd)) != 0)
-		goto bad2;
+	mtx_lock(&pi_mtx);
+	pi->pi_pid = pid;
+	pi->pi_idx = dev2unit(dev);
+	pi->pi_private = PUTTER_EMBRYO;
+	knlist_init_mtx(&pi->pi_sel.si_note, &pi_mtx);
+	mtx_unlock(&pi_mtx);
+
+	TAILQ_INSERT_TAIL(&putter_ilist, pi, pi_entries);
 
 	DPRINTF(("puttercdopen: registered embryonic pmp for pid: %d\n",
 	    pi->pi_pid));
 
-	error = fd_clone(fp, fd, FREAD|FWRITE, &putter_fileops, pi);
-	KASSERT(error == EMOVEFD);
-	return error;
-
- bad2:
- 	fd_abort(p, fp, fd);
- bad1:
-	putter_detach(pi);
-	kmem_free(pi, sizeof(struct putter_instance));
-	return error;
+	return (0);
 }
-
-int
-puttercdclose(dev_t dev, int flags, int fmt, struct lwp *l)
-{
-
-	panic("puttercdclose impossible\n");
-
-	return 0;
-}
-
 
 /*
  * Set the private structure for the file descriptor.  This is
@@ -573,23 +452,22 @@ puttercdclose(dev_t dev, int flags, int fmt, struct lwp *l)
  * the same process opened multiple (since they are equal at this point).
  */
 struct putter_instance *
-putter_attach(pid_t pid, int fd, void *ppriv, struct putter_ops *pop)
+putter_attach(pid_t pid, int unit, void *ppriv, struct putter_ops *pop)
 {
 	struct putter_instance *pi = NULL;
 
-	mutex_enter(&pi_mtx);
+	mtx_lock(&pi_mtx);
 	TAILQ_FOREACH(pi, &putter_ilist, pi_entries) {
 		if (pi->pi_pid == pid && pi->pi_private == PUTTER_EMBRYO) {
 			pi->pi_private = ppriv;
-			pi->pi_fd = fd;
 			pi->pi_pop = pop;
 			break;
 		    }
 	}
-	mutex_exit(&pi_mtx);
+	mtx_unlock(&pi_mtx);
 
 	DPRINTF(("putter_setprivate: pi at %p (%d/%d)\n", pi,
-	    pi ? pi->pi_pid : 0, pi ? pi->pi_fd : 0));
+	    pi ? pi->pi_pid : 0, pi ? pi->pi_idx : 0));
 
 	return pi;
 }
@@ -601,10 +479,10 @@ void
 putter_detach(struct putter_instance *pi)
 {
 
-	mutex_enter(&pi_mtx);
+	mtx_lock(&pi_mtx);
 	TAILQ_REMOVE(&putter_ilist, pi, pi_entries);
 	pi->pi_private = PUTTER_DEAD;
-	mutex_exit(&pi_mtx);
+	mtx_unlock(&pi_mtx);
 
 	DPRINTF(("putter_nukebypmp: nuked %p\n", pi));
 }
@@ -613,55 +491,65 @@ void
 putter_notify(struct putter_instance *pi)
 {
 
-	selnotify(&pi->pi_sel, 0, 0);
+	selwakeup(&pi->pi_sel);
+	KNOTE_UNLOCKED(&pi->pi_sel.si_note, 0);
 }
 
-/* search sorted list of instances for free minor, sorted insert arg */
-static int
-get_pi_idx(struct putter_instance *pi_i)
+static void
+putter_dev_clone(void *arg, struct ucred *cred, char *name, int namelen, struct cdev **dev)
 {
-	struct putter_instance *pi;
-	int i;
+	int unit;
 
-	KASSERT(mutex_owned(&pi_mtx));
+	if (*dev != NULL)
+		return;
+	if (strcmp(name, DEVICE_NAME) == 0)
+		unit = -1;
+	else if (dev_stdclone(name, NULL, DEVICE_NAME, &unit) != 1)
+		return;
 
-	i = 0;
-	TAILQ_FOREACH(pi, &putter_ilist, pi_entries) {
-		if (i != pi->pi_idx)
-			break;
-		i++;
+	if (clone_create(&putter_dev_clones, &putter_cdevsw, &unit, dev, 0)) {
+		*dev = make_dev(&putter_cdevsw, unit,
+				UID_ROOT, GID_WHEEL, 0600, DEVICE_NAME "%d", unit);
+		if (*dev != NULL) {
+			dev_ref(*dev);
+			(*dev)->si_flags |= SI_CHEAPCLONE;
+		}
 	}
-
-	pi_i->pi_private = PUTTER_EMBRYO;
-
-	if (pi == NULL)
-		TAILQ_INSERT_TAIL(&putter_ilist, pi_i, pi_entries);
-	else
-		TAILQ_INSERT_BEFORE(pi, pi_i, pi_entries);
-
-	return i;
 }
 
-MODULE(MODULE_CLASS_MISC, putter, NULL);
-
 static int
-putter_modcmd(modcmd_t cmd, void *arg)
+putter_modevent(module_t mod, int type, void *data)
 {
-#ifdef _MODULE
-	devmajor_t bmajor = NODEVMAJOR, cmajor = NODEVMAJOR;
+	static eventhandler_tag clone_tag;
 
-	switch (cmd) {
-	case MODULE_CMD_INIT:
-		return devsw_attach("putter", NULL, &bmajor,
-		    &putter_cdevsw, &cmajor);
-	case MODULE_CMD_FINI:
-		return devsw_detach(NULL, &putter_cdevsw);
+	switch(type) {
+	case MOD_LOAD:
+		mtx_init(&pi_mtx, "pi_mtx", NULL, MTX_DEF);
+		clone_setup(&putter_dev_clones);
+		clone_tag = EVENTHANDLER_REGISTER(dev_clone, putter_dev_clone, 0, 1000);
+		if (clone_tag == NULL) {
+			clone_cleanup(&putter_dev_clones);
+			mtx_destroy(&pi_mtx);
+			return (ENOMEM);
+		}
+		break;
+
+	case MOD_UNLOAD:
+		EVENTHANDLER_DEREGISTER(dev_clone, clone_tag);
+		clone_cleanup(&putter_dev_clones);
+		mtx_destroy(&pi_mtx);
+		break;
+
+	case MOD_SHUTDOWN:
+		break;
+
 	default:
-		return ENOTTY;
+		return (EOPNOTSUPP);
 	}
-#else
-	if (cmd == MODULE_CMD_INIT)
-		return 0;
-	return ENOTTY;
-#endif
+
+	return (0);
 }
+
+DEV_MODULE(putter, putter_modevent, NULL);
+MODULE_VERSION(putter, 1);
+
